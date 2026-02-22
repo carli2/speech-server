@@ -7,6 +7,9 @@ onnxruntime>=1.16
 # numpy
 # onnxruntime-gpu  # optional: install instead if using CUDA
 
+# Optional: Whisper STT via faster-whisper
+faster-whisper>=1.0
+
 # Optional: FreeVC voice conversion via Coqui TTS (requires PyTorch)
 # Installed automatically when Python < 3.12
 TTS>=0.22; python_version < "3.12"

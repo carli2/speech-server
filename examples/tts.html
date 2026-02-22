@@ -1,0 +1,122 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<title>TTS Demo</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: system-ui, sans-serif; background: #1a1a2e; color: #e0e0e0; display: flex; justify-content: center; padding: 2rem; }
+  .card { background: #16213e; border-radius: 12px; padding: 2rem; max-width: 560px; width: 100%; box-shadow: 0 4px 24px rgba(0,0,0,.4); }
+  h1 { font-size: 1.4rem; margin-bottom: 1.2rem; color: #a8d8ea; }
+  label { display: block; font-size: .85rem; color: #8899aa; margin-bottom: .3rem; }
+  textarea, select, input[type=text] {
+    width: 100%; padding: .6rem .8rem; border: 1px solid #2a3a5c; border-radius: 6px;
+    background: #0f3460; color: #e0e0e0; font-size: .95rem; resize: vertical;
+  }
+  textarea { min-height: 100px; }
+  .row { display: flex; gap: 1rem; margin-top: 1rem; }
+  .row > div { flex: 1; }
+  button {
+    margin-top: 1.2rem; width: 100%; padding: .7rem; border: none; border-radius: 6px;
+    font-size: 1rem; font-weight: 600; cursor: pointer; transition: background .2s;
+  }
+  #btn-speak { background: #e94560; color: #fff; }
+  #btn-speak:hover { background: #c73e54; }
+  #btn-speak:disabled { background: #555; cursor: wait; }
+  #status { margin-top: 1rem; font-size: .85rem; color: #8899aa; min-height: 1.2em; }
+  audio { margin-top: 1rem; width: 100%; }
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>Text-to-Speech</h1>
+
+  <label for="api-url">Server-URL</label>
+  <input type="text" id="api-url" value="https://srv.launix.de/tts">
+
+  <label for="text">Text</label>
+  <textarea id="text" placeholder="Hier Text eingeben...">Hallo Welt! Dies ist ein Test der Sprachsynthese.</textarea>
+
+  <div class="row">
+    <div>
+      <label for="voice">Stimme</label>
+      <select id="voice"><option value="">Lade...</option></select>
+    </div>
+    <div>
+      <label for="speed">Geschwindigkeit</label>
+      <input type="text" id="speed" value="1.0">
+    </div>
+  </div>
+
+  <button id="btn-speak">Sprechen</button>
+  <div id="status"></div>
+  <audio id="player" controls hidden></audio>
+</div>
+
+<script>
+const apiInput = document.getElementById('api-url');
+const params = new URLSearchParams(location.search);
+if (params.get('api')) apiInput.value = params.get('api');
+function API() { return apiInput.value.replace(/\/+$/, ''); }
+
+const voiceSel = document.getElementById('voice');
+const textEl   = document.getElementById('text');
+const speedEl  = document.getElementById('speed');
+const btn      = document.getElementById('btn-speak');
+const status   = document.getElementById('status');
+const player   = document.getElementById('player');
+
+async function loadVoices() {
+  try {
+    const r = await fetch(API() + '/voices');
+    const data = await r.json();
+    voiceSel.innerHTML = '';
+    for (const id of Object.keys(data).sort()) {
+      const opt = document.createElement('option');
+      opt.value = id;
+      opt.textContent = id;
+      voiceSel.appendChild(opt);
+    }
+    if (voiceSel.options.length === 0) {
+      voiceSel.innerHTML = '<option value="">Keine Stimmen</option>';
+    }
+  } catch (e) {
+    voiceSel.innerHTML = '<option value="">Fehler beim Laden</option>';
+  }
+}
+
+btn.addEventListener('click', async () => {
+  const text = textEl.value.trim();
+  if (!text) return;
+  btn.disabled = true;
+  status.textContent = 'Synthesiere...';
+  player.hidden = true;
+
+  try {
+    const body = { text, voice: voiceSel.value };
+    const ls = parseFloat(speedEl.value);
+    if (ls > 0 && ls !== 1.0) body.length_scale = 1.0 / ls;
+
+    const r = await fetch(API() + '/', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (!r.ok) throw new Error('Server: ' + r.status);
+    const blob = await r.blob();
+    const url = URL.createObjectURL(blob);
+    player.src = url;
+    player.hidden = false;
+    player.play();
+    status.textContent = 'Fertig (' + (blob.size / 1024).toFixed(1) + ' kB)';
+  } catch (e) {
+    status.textContent = 'Fehler: ' + e.message;
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+loadVoices();
+</script>
+</body>
+</html>

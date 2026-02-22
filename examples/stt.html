@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<title>STT Demo</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: system-ui, sans-serif; background: #1a1a2e; color: #e0e0e0; display: flex; justify-content: center; padding: 2rem; }
+  .card { background: #16213e; border-radius: 12px; padding: 2rem; max-width: 560px; width: 100%; box-shadow: 0 4px 24px rgba(0,0,0,.4); }
+  h1 { font-size: 1.4rem; margin-bottom: 1.2rem; color: #a8d8ea; }
+  label { display: block; font-size: .85rem; color: #8899aa; margin-bottom: .3rem; }
+  input[type=text] {
+    width: 100%; padding: .5rem .8rem; border: 1px solid #2a3a5c; border-radius: 6px;
+    background: #0f3460; color: #e0e0e0; font-size: .9rem; margin-bottom: 1rem;
+  }
+  button {
+    width: 100%; padding: .8rem; border: none; border-radius: 6px;
+    font-size: 1rem; font-weight: 600; cursor: pointer; transition: background .2s;
+  }
+  #btn-rec { background: #e94560; color: #fff; }
+  #btn-rec:hover { background: #c73e54; }
+  #btn-rec.recording { background: #28a745; }
+  #btn-rec.recording:hover { background: #218838; }
+  #level-bar { margin-top: 1rem; height: 6px; border-radius: 3px; background: #0f3460; overflow: hidden; }
+  #level-fill { height: 100%; width: 0%; background: #e94560; transition: width 60ms; }
+  #transcript {
+    margin-top: 1.2rem; min-height: 160px; max-height: 400px; overflow-y: auto;
+    background: #0f3460; border-radius: 6px; padding: 1rem; font-size: .95rem;
+    line-height: 1.5; white-space: pre-wrap; word-break: break-word;
+  }
+  #transcript:empty::before { content: 'Transkription erscheint hier...'; color: #556; }
+  #status { margin-top: .8rem; font-size: .85rem; color: #8899aa; min-height: 1.2em; }
+  .seg { color: #e0e0e0; }
+  .seg .time { color: #5588aa; font-size: .8rem; margin-right: .4rem; }
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>Speech-to-Text (Mikrofon)</h1>
+
+  <label for="api-url">Server-URL</label>
+  <input type="text" id="api-url" value="https://srv.launix.de/tts">
+
+  <button id="btn-rec">Aufnahme starten</button>
+  <div id="level-bar"><div id="level-fill"></div></div>
+  <div id="transcript"></div>
+  <div id="status"></div>
+</div>
+
+<script>
+const apiInput   = document.getElementById('api-url');
+const btn        = document.getElementById('btn-rec');
+const transcript = document.getElementById('transcript');
+const statusEl   = document.getElementById('status');
+const levelFill  = document.getElementById('level-fill');
+
+const params = new URLSearchParams(location.search);
+if (params.get('api')) apiInput.value = params.get('api');
+
+let recording = false;
+let mediaStream = null;
+let audioCtx = null;
+let analyser = null;
+let scriptNode = null;
+let levelRaf = null;
+let streamController = null;  // WritableStream controller for upload
+let responseReader = null;     // ReadableStream reader for NDJSON response
+
+function fmtTime(s) {
+  const m = Math.floor(s / 60);
+  const sec = (s % 60).toFixed(1);
+  return m > 0 ? m + ':' + sec.padStart(4, '0') : sec + 's';
+}
+
+function addSegment(seg) {
+  const div = document.createElement('div');
+  div.className = 'seg';
+  const timeSpan = document.createElement('span');
+  timeSpan.className = 'time';
+  timeSpan.textContent = '[' + fmtTime(seg.start) + '-' + fmtTime(seg.end) + ']';
+  div.appendChild(timeSpan);
+  div.appendChild(document.createTextNode(seg.text));
+  transcript.appendChild(div);
+  transcript.scrollTop = transcript.scrollHeight;
+}
+
+function updateLevel() {
+  if (!analyser) return;
+  const buf = new Uint8Array(analyser.fftSize);
+  analyser.getByteTimeDomainData(buf);
+  let sum = 0;
+  for (let i = 0; i < buf.length; i++) {
+    const v = (buf[i] - 128) / 128;
+    sum += v * v;
+  }
+  const rms = Math.sqrt(sum / buf.length);
+  levelFill.style.width = Math.min(100, rms * 400) + '%';
+  if (recording) levelRaf = requestAnimationFrame(updateLevel);
+}
+
+// Read NDJSON response in background
+async function readResponse(response) {
+  const reader = response.body.getReader();
+  responseReader = reader;
+  const decoder = new TextDecoder();
+  let buf = '';
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      const lines = buf.split('\n');
+      buf = lines.pop();
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        try { addSegment(JSON.parse(line)); } catch (_) {}
+      }
+    }
+    if (buf.trim()) {
+      try { addSegment(JSON.parse(buf)); } catch (_) {}
+    }
+  } catch (e) {
+    if (e.name !== 'AbortError') {
+      statusEl.textContent = 'Lesefehler: ' + e.message;
+    }
+  }
+}
+
+async function start() {
+  transcript.innerHTML = '';
+  statusEl.textContent = 'Mikrofon wird angefordert...';
+
+  try {
+    mediaStream = await navigator.mediaDevices.getUserMedia({
+      audio: { channelCount: 1, echoCancellation: false, noiseSuppression: false }
+    });
+  } catch (e) {
+    statusEl.textContent = 'Mikrofon-Zugriff verweigert: ' + e.message;
+    return;
+  }
+
+  audioCtx = new AudioContext();
+  const nativeRate = audioCtx.sampleRate;
+  const source = audioCtx.createMediaStreamSource(mediaStream);
+
+  analyser = audioCtx.createAnalyser();
+  analyser.fftSize = 512;
+  source.connect(analyser);
+
+  // Create a ReadableStream that we push PCM chunks into
+  let controller;
+  const uploadStream = new ReadableStream({
+    start(c) { controller = c; streamController = c; },
+  });
+
+  // Start the fetch with streaming body immediately
+  const api = apiInput.value.replace(/\/+$/, '');
+  const fetchPromise = fetch(api + '/inputstream', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/octet-stream',
+      'X-Sample-Rate': String(nativeRate),
+    },
+    body: uploadStream,
+    duplex: 'half',
+  });
+
+  // Read response in background as it arrives
+  fetchPromise.then(r => {
+    if (!r.ok) {
+      statusEl.textContent = 'Server-Fehler: ' + r.status;
+      return;
+    }
+    readResponse(r);
+  }).catch(e => {
+    if (e.name !== 'AbortError') {
+      statusEl.textContent = 'Verbindungsfehler: ' + e.message;
+    }
+  });
+
+  // Capture PCM and push into upload stream
+  const bufSize = 4096;
+  scriptNode = audioCtx.createScriptProcessor(bufSize, 1, 1);
+  scriptNode.onaudioprocess = (e) => {
+    if (!recording || !controller) return;
+    const float32 = e.inputBuffer.getChannelData(0);
+    const int16 = new Int16Array(float32.length);
+    for (let i = 0; i < float32.length; i++) {
+      int16[i] = Math.max(-32768, Math.min(32767, Math.round(float32[i] * 32767)));
+    }
+    controller.enqueue(new Uint8Array(int16.buffer));
+  };
+  source.connect(scriptNode);
+  scriptNode.connect(audioCtx.destination);
+
+  recording = true;
+  btn.textContent = 'Aufnahme stoppen';
+  btn.classList.add('recording');
+  statusEl.textContent = 'Streaming... (' + nativeRate + ' Hz)';
+  updateLevel();
+}
+
+async function stop() {
+  recording = false;
+  btn.textContent = 'Aufnahme starten';
+  btn.classList.remove('recording');
+  levelFill.style.width = '0%';
+  if (levelRaf) cancelAnimationFrame(levelRaf);
+  if (scriptNode) { scriptNode.disconnect(); scriptNode = null; }
+  if (analyser) { analyser.disconnect(); analyser = null; }
+  if (mediaStream) { mediaStream.getTracks().forEach(t => t.stop()); mediaStream = null; }
+  if (audioCtx) { audioCtx.close(); audioCtx = null; }
+
+  // Close the upload stream -> server gets EOF -> flushes remaining buffer
+  if (streamController) {
+    try { streamController.close(); } catch (_) {}
+    streamController = null;
+  }
+
+  statusEl.textContent = 'Warte auf letzte Ergebnisse...';
+}
+
+btn.addEventListener('click', () => {
+  if (recording) stop(); else start();
+});
+</script>
+</body>
+</html>

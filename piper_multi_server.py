@@ -499,9 +499,9 @@ def create_app(args: argparse.Namespace) -> Flask:
     @app.after_request
     def add_cors_headers(resp):  # type: ignore
         resp.headers["Access-Control-Allow-Origin"] = "*"
-        resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+        resp.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, OPTIONS"
         # Allow Authorization so server-side bearer fetches are configurable if ever proxied
-        resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Accept, Authorization"
+        resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Accept, Authorization, X-Sample-Rate"
         # Media streaming hint for proxies
         resp.headers["X-Accel-Buffering"] = "no"
         # Be explicit about referrer policy if the browser surfaces strict-origin-when-cross-origin
@@ -786,52 +786,81 @@ def create_app(args: argparse.Namespace) -> Flask:
         resp.call_on_close(lambda: writer.cancel())
         return resp
 
-    # ---- Streaming TTS: text streams in, audio streams out on one connection ----
-    @app.route("/tts/stream", methods=["POST", "OPTIONS"])
-    def tts_stream_endpoint():
+    # ---- STT: Whisper streaming endpoint ----
+    @app.route("/inputstream", methods=["POST", "PUT", "OPTIONS"])
+    def inputstream():
+        """Receive raw PCM (s16le, mono) and stream back NDJSON transcription.
+
+        Accepts X-Sample-Rate header (default 16000). If != 16000,
+        a SampleRateConverter stage resamples via ffmpeg.
+
+        Pipeline: PCMInputReader -> [SampleRateConverter] -> WhisperTranscriber -> NDJSON
+        """
         if request.method == "OPTIONS":
             return ("", 204)
-        model_id = default_model_id
-        if not model_id:
-            return ("No voice available", 404, {"Content-Type": "text/plain"})
-        voice = registry.ensure_loaded(model_id)
-        syn = registry.create_synthesis_config(voice, {})
-        sr = voice.config.sample_rate
-        input_stream = request.stream
 
-        def gen():
-            # WAV header with max size (streaming, unknown total length)
-            data_size = 0x7FFFFFFF
-            riff_size = 36 + data_size
-            yield (b"RIFF" + riff_size.to_bytes(4, "little") + b"WAVEfmt "
-                   + (16).to_bytes(4, "little") + (1).to_bytes(2, "little")
-                   + (1).to_bytes(2, "little") + sr.to_bytes(4, "little")
-                   + (sr * 2).to_bytes(4, "little") + (2).to_bytes(2, "little")
-                   + (16).to_bytes(2, "little") + b"data"
-                   + data_size.to_bytes(4, "little"))
-            buf = b''
+        from lib import PCMInputReader, SampleRateConverter
+        from lib.WhisperSTT import WhisperTranscriber
+
+        src_rate = int(request.headers.get('X-Sample-Rate', 16000))
+        model_size = getattr(args, 'whisper_model', 'base')
+
+        # Build pipeline
+        source = PCMInputReader(request.stream)
+        pipeline = source
+        if src_rate != 16000:
+            pipeline = pipeline.pipe(SampleRateConverter(src_rate, 16000))
+        pipeline = pipeline.pipe(WhisperTranscriber(model_size))
+
+        def generate():
+            for chunk in pipeline.stream_pcm24k():
+                if source.cancelled:
+                    break
+                yield chunk
+
+        resp = Response(stream_with_context(generate()), mimetype="application/x-ndjson")
+        resp.headers["X-Accel-Buffering"] = "no"
+        resp.call_on_close(lambda: source.cancel())
+        return resp
+
+    # ---- Streaming TTS: params via GET, POST body = text stream, response = audio stream ----
+    @app.route("/tts/stream", methods=["POST", "OPTIONS"])
+    def tts_stream():
+        if request.method == "OPTIONS":
+            return ("", 204)
+        model_id = request.args.get("voice", default_model_id)
+        voice = registry.ensure_loaded(model_id)
+        syn = registry.create_synthesis_config(voice, request.args.to_dict())
+
+        def text_lines():
+            """Yield text lines from the streamed POST body."""
+            buf = b""
             while True:
-                chunk = input_stream.read(4096)
+                chunk = request.stream.read(4096)
                 if not chunk:
                     break
                 buf += chunk
-                while b'\n' in buf:
-                    line, buf = buf.split(b'\n', 1)
-                    text = line.decode('utf-8', errors='replace').strip()
+                while b"\n" in buf:
+                    line, buf = buf.split(b"\n", 1)
+                    text = line.decode("utf-8", errors="replace").strip()
                     if text:
-                        _LOGGER.info("tts/stream: synthesizing %d chars", len(text))
-                        for audio_chunk in voice.synthesize(text, syn):
-                            yield audio_chunk.audio_int16_bytes
-            # Flush remaining text
-            text = buf.decode('utf-8', errors='replace').strip()
+                        yield text
+            text = buf.decode("utf-8", errors="replace").strip()
             if text:
-                _LOGGER.info("tts/stream: flushing %d chars", len(text))
-                for audio_chunk in voice.synthesize(text, syn):
-                    yield audio_chunk.audio_int16_bytes
+                yield text
 
-        resp = Response(stream_with_context(gen()), mimetype="audio/wav")
+        # Pipeline: StreamingTTSProducer -> ResponseWriter
+        from lib import StreamingTTSProducer, ResponseWriter
+        source = StreamingTTSProducer(text_lines(), voice, syn)
+        writer = ResponseWriter(source, est_frames_24k=None)
+
+        resp = Response(stream_with_context(writer.stream()), mimetype="audio/wav")
         resp.headers["X-Accel-Buffering"] = "no"
-        resp.headers["Content-Disposition"] = "inline"
+        try:
+            writer.apply_headers(resp)
+        except Exception:
+            pass
+        resp.call_on_close(lambda: source.cancel())
         return resp
 
     return app
@@ -848,6 +877,7 @@ def main() -> None:
     parser.add_argument("--sentence-silence", type=float, default=0.0, help="Seconds of silence between sentences")
     parser.add_argument("--soundpath", default="../voices/%s.wav", help="Template for sound/voice2 source. Use %s placeholder for id. Supports file paths or http(s) URLs.")
     parser.add_argument("--bearer", default="", help="Bearer token for authorizing remote (http/https) downloads/streams")
+    parser.add_argument("--whisper-model", default="base", help="Whisper model size for STT (default: base)")
     parser.add_argument("--debug", action="store_true")
     args = parser.parse_args()
 

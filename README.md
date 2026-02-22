@@ -9,32 +9,97 @@ Multi-voice TTS/STT HTTP server with realtime streaming, voice conversion, and p
 - **Voice conversion** via FreeVC (Coqui TTS) to transform timbre to a target voice
 - **Pitch adjustment** via ffmpeg rubberband (formant-preserving)
 - **CORS enabled** for browser usage
-- **Streaming endpoint** (`/tts/stream`) for text-in, audio-out on a single connection
+- **Speech-to-text** via [faster-whisper](https://github.com/SYSTRAN/faster-whisper) with streaming NDJSON output
+- **Streaming TTS** (`POST /tts/stream`) — text in via request body, audio out as streaming WAV, single HTTP connection
+- **Streaming STT** (`POST /inputstream`) — PCM audio in via request body, NDJSON transcription out, single HTTP connection
 
 ## Architecture
 
-The server uses a pipeline of composable stages that process audio as a stream of PCM chunks:
+The server uses a pipeline of composable stages that process audio as a stream of PCM chunks. Each stage extends `Stage` (`lib/base.py`), implements `stream_pcm24k() -> Iterator[bytes]`, and connects via `.pipe()`:
 
 ```
-Source              Processors                    Sink
-──────              ──────────                    ────
-TTSProducer    ──►  VCConverter  ──►  PitchAdjuster  ──►  ResponseWriter
-AudioReader                                               RawResponseWriter
+Source ──► Processor ──► Processor ──► Sink
 ```
 
-Each stage implements `stream_pcm24k() -> Iterator[bytes]` and connects via `.pipe()`.
+### Example pipelines
 
-### Existing Stages
+```
+POST /              TTS:            TTSProducer ──► VCConverter ──► PitchAdjuster ──► ResponseWriter
+POST /              Sound:          AudioReader ──► VCConverter ──► PitchAdjuster ──► ResponseWriter
+POST /tts/stream    Streaming TTS:  text_lines(request.stream) ──► StreamingTTSProducer ──► ResponseWriter
+POST /inputstream   STT (16kHz):    PCMInputReader ──► WhisperTranscriber ──► NDJSON
+POST /inputstream   STT (48kHz):    PCMInputReader ──► SampleRateConverter(48k→16k) ──► WhisperTranscriber ──► NDJSON
+                    SIP (planned):  SIPSource ──► SampleRateConverter ──► WhisperTranscriber ──► [LLM] ──► TTSProducer ──► SIPSink
+```
 
-| Stage | Type | Description |
-|-------|------|-------------|
-| `TTSProducer` | Source | Text to PCM via Piper |
-| `AudioReader` | Source | File/URL to PCM via ffmpeg |
-| `VCConverter` | Processor | Voice conversion via FreeVC |
-| `PitchAdjuster` | Processor | Pitch shifting via ffmpeg rubberband |
-| `ResponseWriter` | Sink | PCM to WAV HTTP streaming response |
-| `RawResponseWriter` | Sink | Raw file passthrough |
-| `FileFetcher` | Utility | HTTP/file download abstraction |
+### All Stages
+
+#### Sources (produce PCM, no upstream)
+
+| Stage | File | Status | Description |
+|-------|------|--------|-------------|
+| `TTSProducer` | `lib/TTSProducer.py` | vorhanden | Text (fester String) zu PCM via Piper ONNX. Streamt satzweise. |
+| `StreamingTTSProducer` | `lib/StreamingTTSProducer.py` | vorhanden | Text (Iterable von Zeilen) zu PCM via Piper ONNX. Synthetisiert jede Zeile sobald sie ankommt — fuer `/tts/stream` und SIP. |
+| `AudioReader` | `lib/AudioReader.py` | vorhanden | Liest Audio aus Datei/URL via ffmpeg, gibt PCM 24kHz s16le mono aus. Bearer-Auth fuer Remote-Dateien. |
+| `PCMInputReader` | `lib/PCMInputReader.py` | vorhanden | Liest rohe PCM-Bytes aus einem Stream (z.B. HTTP Request Body, Mikrofon-Input). |
+| `SIPSource` | -- | **geplant** | Empfaengt RTP-Audio aus einem SIP-Call als PCM-Stream. Registriert sich als SIP-User-Agent via PJSIP oder baresip. |
+
+#### Processors (transform PCM, have upstream)
+
+| Stage | File | Status | Description |
+|-------|------|--------|-------------|
+| `VCConverter` | `lib/VCConverter.py` | vorhanden | Voice Conversion via FreeVC (Coqui TTS). Aendert Klangfarbe auf Zielstimme. Passthrough wenn FreeVC nicht installiert. |
+| `PitchAdjuster` | `lib/PitchAdjuster.py` | vorhanden | Pitch-Shifting via ffmpeg rubberband (formant-erhaltend). Auto-Schaetzung aus Source/Target-F0 oder expliziter Semitone-Override. |
+| `SampleRateConverter` | `lib/SampleRateConverter.py` | vorhanden | Resampling zwischen beliebigen Sample-Raten via ffmpeg (z.B. 48kHz Browser → 16kHz fuer Whisper). No-op wenn Raten gleich. |
+| `NoiseGate` | -- | **geplant** | Entfernt Stille/Rauschen aus dem Stream, spart Whisper-Rechenzeit. |
+| `AudioMixer` | -- | **geplant** | Mischt mehrere PCM-Streams (z.B. fuer SIP-Konferenzen). |
+
+#### Sinks (consume PCM, produce output)
+
+| Stage | File | Status | Description |
+|-------|------|--------|-------------|
+| `ResponseWriter` | `lib/ResponseWriter.py` | vorhanden | Streamt PCM als WAV-HTTP-Response mit korrekten Headern und Content-Length-Schaetzung. |
+| `RawResponseWriter` | `lib/RawResponseWriter.py` | vorhanden | Roher Datei-Passthrough (kein Resampling, kein WAV-Header). |
+| `WhisperTranscriber` | `lib/WhisperSTT.py` | vorhanden | Nimmt PCM-Stream entgegen, transkribiert in 3-Sekunden-Chunks via faster-whisper, gibt NDJSON-Segmente aus (`{text, start, end}`). Lazy Model-Loading, CPU/CUDA Auto-Detect mit Fallback. |
+| `SIPSink` | -- | **geplant** | Sendet PCM-Audio als RTP-Pakete in einen SIP-Call. Gegenstueck zu SIPSource. |
+
+#### Services & Utilities (keine Stages, aber von Stages genutzt)
+
+| Component | File | Status | Description |
+|-----------|------|--------|-------------|
+| `WhisperSTT` | `lib/WhisperSTT.py` | vorhanden | Singleton-Wrapper um faster-whisper. Lazy Loading, CUDA/CPU Auto-Detect, Resampling auf 16kHz. Wird von WhisperTranscriber genutzt. |
+| `FileFetcher` | `lib/FileFetcher.py` | vorhanden | Download von HTTP(S)-URLs oder lokalen Dateien. Bearer-Auth. Genutzt von AudioReader und VCConverter. |
+| `FreeVCService` | `lib/vc_service.py` | vorhanden | Singleton FreeVC-Modell-Manager. CPU/CUDA Auto-Detect. Intern von VCConverter genutzt. |
+| `TTSRegistry` | `lib/registry.py` | vorhanden | Voice-Discovery, Caching und Lazy Loading fuer Piper ONNX-Modelle. |
+
+### Geplant: SIP-Integration
+
+Ziel: Der Server kann sich in SIP-Calls einwaehlen und dort als Gespraechspartner agieren (Vollduplex).
+
+```
+Eingehend (hoeren):
+  SIPSource ──► SampleRateConverter(8k→16k) ──► WhisperTranscriber ──► Text
+
+Ausgehend (sprechen):
+  Text ──► TTSProducer ──► SampleRateConverter(24k→8k) ──► SIPSink
+
+Vollduplex-Call:
+  ┌─ SIPSource ──► SampleRateConverter ──► WhisperTranscriber ──► [LLM/Logic] ─┐
+  │                                                                             │
+  └─ SIPSink   ◄── SampleRateConverter ◄── TTSProducer ◄───────────────────────┘
+```
+
+Geplante SIP-Stages:
+- **`SIPSource`** -- RTP-Empfang aus SIP-Call, liefert PCM-Stream (typisch 8kHz G.711 oder 16kHz). Registrierung als SIP-User-Agent via PJSIP oder baresip.
+- **`SIPSink`** -- PCM-Stream als RTP in den SIP-Call senden. Encoding in G.711/Opus.
+- **`SIPSession`** -- Orchestriert Source+Sink fuer einen Call: Dial, Hangup, DTMF, Hold/Resume. Verwaltet SIP-Registrierung und Call-State.
+- **`AudioMixer`** -- Mischt mehrere PCM-Streams fuer Konferenz-Szenarien.
+
+### Geplant: Weitere Stages
+
+- **`NoiseGate`** -- Filtert Stille und Hintergrundrauschen vor der Transkription, reduziert Whisper-Last.
+- **`VADSplitter`** -- Voice Activity Detection als Stage: splittet den Stream in Sprach-Segmente, leitet nur aktive Teile weiter.
+- **`LLMBridge`** -- Nimmt transkribierten Text, sendet ihn an ein LLM (lokal oder API), gibt Antwort-Text an TTSProducer weiter. Ermoeglicht autonome Gespraeche.
 
 ## Requirements
 
@@ -42,6 +107,7 @@ Each stage implements `stream_pcm24k() -> Iterator[bytes]` and connects via `.pi
 - espeak-ng (`sudo apt install espeak-ng`)
 - ffmpeg with rubberband support (`sudo apt install ffmpeg`)
 - [Piper](https://github.com/rhasspy/piper) Python bindings (install from source)
+- [faster-whisper](https://github.com/SYSTRAN/faster-whisper) (optional, for STT)
 
 ## Installation
 
@@ -132,8 +198,108 @@ Parameters:
 - `pitch_factor` - Pitch multiplier (alternative to `pitch_st`)
 - `pitch_disable` - Disable pitch processing (`1`/`true`)
 
+### `POST /inputstream`
+Streaming speech-to-text on a single HTTP connection. Raw PCM audio goes in via the request body, recognized text comes back as NDJSON.
+
+Headers:
+- `X-Sample-Rate` - Input sample rate in Hz (default: `16000`). If not 16000, a `SampleRateConverter` stage automatically resamples via ffmpeg.
+
+Pipeline: `PCMInputReader(request.stream) -> [SampleRateConverter] -> WhisperTranscriber -> NDJSON`
+
+Each output line is a JSON object:
+```json
+{"text": "hallo welt", "start": 0.0, "end": 1.5}
+```
+
+#### Examples
+
+```bash
+# Live microphone (16kHz, default)
+arecord -f S16_LE -r 16000 -c 1 -t raw -q - | \
+  curl -sN -T - -H "Content-Type: application/octet-stream" \
+  http://localhost:5000/inputstream
+
+# Live microphone (48kHz, browser-compatible rate)
+arecord -f S16_LE -r 48000 -c 1 -t raw -q - | \
+  curl -sN -T - -H "Content-Type: application/octet-stream" \
+  -H "X-Sample-Rate: 48000" \
+  http://localhost:5000/inputstream
+
+# Audio file via ffmpeg
+ffmpeg -i test.wav -f s16le -ac 1 -ar 16000 - | \
+  curl -sN -T - -H "Content-Type: application/octet-stream" \
+  http://localhost:5000/inputstream
+```
+
+Note: Use `curl -T -` (not `--data-binary @-`) to stream stdin in real time. `--data-binary` buffers the entire input before sending.
+
+Use `--whisper-model` to select the model size (default: `base`). Available: `tiny`, `base`, `small`, `medium`, `large-v3`.
+
 ### `POST /tts/stream`
-Streaming TTS. Send text line-by-line in the request body; receive WAV audio as a streaming response.
+Streaming TTS on a single HTTP connection. Text goes in via the request body, audio comes back as a streaming WAV response. The connection stays open — each line of text is synthesized and streamed as audio as soon as it arrives.
+
+Query parameters (all optional):
+- `voice` - Voice model ID (default: server default)
+- `length_scale` - Speech speed (1.0 = normal)
+- `noise_scale` - Phoneme noise
+- `noise_w_scale` - Phoneme width noise
+
+The request body is plain text (`Content-Type: text/plain`), newline-delimited. Each line is treated as a sentence and synthesized independently. The response is a streaming `audio/wav` (PCM16, mono) with a provisional WAV header.
+
+Pipeline: `text_lines(request.stream) -> voice.synthesize() -> streaming WAV response`
+
+#### Examples
+
+```bash
+# Simple: synthesize a single sentence
+echo "Hallo Welt." | curl -X POST -H 'Content-Type: text/plain' \
+  --data-binary @- -o out.wav 'http://localhost:5000/tts/stream?voice=de_DE-thorsten-medium'
+
+# Streaming from a process (e.g. LLM output) — audio starts before input is complete
+my_llm_command | curl -T - -H 'Content-Type: text/plain' \
+  -o out.wav 'http://localhost:5000/tts/stream?voice=de_DE-thorsten-medium'
+
+# Multiple sentences, streamed line by line
+printf "Erster Satz.\nZweiter Satz.\nDritter Satz.\n" | \
+  curl -T - -H 'Content-Type: text/plain' \
+  -o out.wav 'http://localhost:5000/tts/stream'
+
+# Pipe from an LLM and play in real time (requires sox)
+my_llm_command | curl -sN -T - -H 'Content-Type: text/plain' \
+  'http://localhost:5000/tts/stream?voice=de_DE-thorsten-medium' | \
+  play -t wav -
+```
+
+Note: Use `curl -T -` (not `--data-binary @-`) to stream stdin in real time. `--data-binary` buffers the entire input before sending.
+
+#### Browser usage
+
+Use `fetch()` with `duplex: 'half'` and a `ReadableStream` body to send text incrementally while receiving audio on the same connection:
+
+```js
+var controller;
+var bodyStream = new ReadableStream({
+  start: function(c) { controller = c; }
+});
+
+fetch('/tts/stream?voice=de_DE-thorsten-medium', {
+  method: 'POST',
+  headers: {'Content-Type': 'text/plain'},
+  duplex: 'half',
+  body: bodyStream
+}).then(function(response) {
+  // response.body is a ReadableStream of WAV audio (44-byte header + PCM16)
+  var reader = response.body.getReader();
+  // ... parse WAV header, decode PCM, schedule via Web Audio API
+});
+
+// Push text as it becomes available:
+controller.enqueue(new TextEncoder().encode("Erster Satz.\n"));
+controller.enqueue(new TextEncoder().encode("Zweiter Satz.\n"));
+
+// Signal end of input:
+controller.close();
+```
 
 ## License
 

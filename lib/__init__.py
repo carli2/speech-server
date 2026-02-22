@@ -6,6 +6,10 @@ from .PitchAdjuster import PitchAdjuster
 from .ResponseWriter import ResponseWriter
 from .FileFetcher import FileFetcher
 from .RawResponseWriter import RawResponseWriter
+from .PCMInputReader import PCMInputReader
+from .StreamingTTSProducer import StreamingTTSProducer
+from .SampleRateConverter import SampleRateConverter
+from .WhisperSTT import WhisperTranscriber
 
 # Optional convenience re-exports for TTS registry
 try:
