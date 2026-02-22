@@ -10,6 +10,8 @@ from .PCMInputReader import PCMInputReader
 from .StreamingTTSProducer import StreamingTTSProducer
 from .SampleRateConverter import SampleRateConverter
 from .WhisperSTT import WhisperTranscriber
+from .WebSocketReader import WebSocketReader
+from .WebSocketWriter import WebSocketWriter
 
 # Optional convenience re-exports for TTS registry
 try:

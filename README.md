@@ -12,6 +12,8 @@ Multi-voice TTS/STT HTTP server with realtime streaming, voice conversion, and p
 - **Speech-to-text** via [faster-whisper](https://github.com/SYSTRAN/faster-whisper) with streaming NDJSON output
 - **Streaming TTS** (`POST /tts/stream`) — text in via request body, audio out as streaming WAV, single HTTP connection
 - **Streaming STT** (`POST /inputstream`) — PCM audio in via request body, NDJSON transcription out, single HTTP connection
+- **WebSocket STT** (`/ws/stt`) — PCM audio in via WebSocket binary frames, NDJSON text out. Works through Apache `mod_proxy_wstunnel` and in all browsers (Chrome, Firefox, Safari)
+- **WebSocket TTS** (`/ws/tts`) — text in via WebSocket text frames, PCM audio out as binary frames. Works through Apache `mod_proxy_wstunnel` and in all browsers
 
 ## Architecture
 
@@ -29,6 +31,8 @@ POST /              Sound:          AudioReader ──► VCConverter ──► 
 POST /tts/stream    Streaming TTS:  text_lines(request.stream) ──► StreamingTTSProducer ──► ResponseWriter
 POST /inputstream   STT (16kHz):    PCMInputReader ──► WhisperTranscriber ──► NDJSON
 POST /inputstream   STT (48kHz):    PCMInputReader ──► SampleRateConverter(48k→16k) ──► WhisperTranscriber ──► NDJSON
+WS   /ws/stt        STT (WebSocket): WebSocketReader ──► SampleRateConverter ──► WhisperTranscriber ──► ws.send(NDJSON)
+WS   /ws/tts        TTS (WebSocket): WebSocketReader.text_lines() ──► StreamingTTSProducer ──► WebSocketWriter
                     SIP (planned):  SIPSource ──► SampleRateConverter ──► WhisperTranscriber ──► [LLM] ──► TTSProducer ──► SIPSink
 ```
 
@@ -42,6 +46,7 @@ POST /inputstream   STT (48kHz):    PCMInputReader ──► SampleRateConverter
 | `StreamingTTSProducer` | `lib/StreamingTTSProducer.py` | vorhanden | Text (Iterable von Zeilen) zu PCM via Piper ONNX. Synthetisiert jede Zeile sobald sie ankommt — fuer `/tts/stream` und SIP. |
 | `AudioReader` | `lib/AudioReader.py` | vorhanden | Liest Audio aus Datei/URL via ffmpeg, gibt PCM 24kHz s16le mono aus. Bearer-Auth fuer Remote-Dateien. |
 | `PCMInputReader` | `lib/PCMInputReader.py` | vorhanden | Liest rohe PCM-Bytes aus einem Stream (z.B. HTTP Request Body, Mikrofon-Input). |
+| `WebSocketReader` | `lib/WebSocketReader.py` | vorhanden | Liest binary oder text Messages aus einem flask-sock WebSocket. `stream_pcm24k()` fuer PCM-Bytes (STT), `text_lines()` fuer Text (TTS). |
 | `SIPSource` | -- | **geplant** | Empfaengt RTP-Audio aus einem SIP-Call als PCM-Stream. Registriert sich als SIP-User-Agent via PJSIP oder baresip. |
 
 #### Processors (transform PCM, have upstream)
@@ -61,6 +66,7 @@ POST /inputstream   STT (48kHz):    PCMInputReader ──► SampleRateConverter
 | `ResponseWriter` | `lib/ResponseWriter.py` | vorhanden | Streamt PCM als WAV-HTTP-Response mit korrekten Headern und Content-Length-Schaetzung. |
 | `RawResponseWriter` | `lib/RawResponseWriter.py` | vorhanden | Roher Datei-Passthrough (kein Resampling, kein WAV-Header). |
 | `WhisperTranscriber` | `lib/WhisperSTT.py` | vorhanden | Nimmt PCM-Stream entgegen, transkribiert in 3-Sekunden-Chunks via faster-whisper, gibt NDJSON-Segmente aus (`{text, start, end}`). Lazy Model-Loading, CPU/CUDA Auto-Detect mit Fallback. |
+| `WebSocketWriter` | `lib/WebSocketWriter.py` | vorhanden | Liest PCM von upstream, sendet als binary WebSocket-Messages (chunked). Sendet `__END__` zum Abschluss. |
 | `SIPSink` | -- | **geplant** | Sendet PCM-Audio als RTP-Pakete in einen SIP-Call. Gegenstueck zu SIPSource. |
 
 #### Services & Utilities (keine Stages, aber von Stages genutzt)
@@ -272,6 +278,44 @@ my_llm_command | curl -sN -T - -H 'Content-Type: text/plain' \
 
 Note: Use `curl -T -` (not `--data-binary @-`) to stream stdin in real time. `--data-binary` buffers the entire input before sending.
 
+### `WS /ws/stt`
+WebSocket speech-to-text. Replaces `POST /inputstream` for browser use — works through Apache `mod_proxy_wstunnel` and in all browsers (Chrome, Firefox, Safari).
+
+Protocol:
+1. Client connects to `ws://host:port/ws/stt`
+2. Client sends a JSON text message: `{"sampleRate": 48000, "language": "de", "chunkSeconds": 2.0}` (only `sampleRate` required; `language` avoids per-chunk auto-detection, `chunkSeconds` controls transcription latency, default 2.0)
+3. Client sends binary frames (PCM s16le mono at the declared sample rate)
+4. Server sends text frames (one NDJSON line per segment: `{"text": "...", "start": 0.0, "end": 1.5}`)
+5. Client sends `__END__` text message when done
+6. Server sends `__END__` text message after final results
+
+Pipeline: `WebSocketReader -> SampleRateConverter -> WhisperTranscriber -> ws.send(NDJSON)`
+
+### `WS /ws/tts`
+WebSocket text-to-speech. Replaces `POST /tts/stream` for browser use.
+
+Query parameters: `?voice=de_DE-thorsten-medium` (optional)
+
+Protocol:
+1. Client connects to `ws://host:port/ws/tts?voice=...`
+2. Server sends a JSON text message: `{"sample_rate": 24000}`
+3. Client sends text frames (one sentence per message)
+4. Server sends binary frames (PCM s16le mono at the declared sample rate)
+5. Client sends `__END__` text message when done
+6. Server sends `__END__` text message after all audio is sent
+
+Pipeline: `WebSocketReader.text_lines() -> StreamingTTSProducer -> WebSocketWriter`
+
+### Apache Proxy
+
+WebSocket endpoints require `mod_proxy_wstunnel`. Add WS rules **before** the HTTP rule:
+
+```apache
+ProxyPass /tts/ws/stt ws://localhost:5000/ws/stt
+ProxyPass /tts/ws/tts ws://localhost:5000/ws/tts
+ProxyPass /tts http://localhost:5000
+```
+
 #### Browser usage
 
 Use `fetch()` with `duplex: 'half'` and a `ReadableStream` body to send text incrementally while receiving audio on the same connection:
@@ -300,6 +344,15 @@ controller.enqueue(new TextEncoder().encode("Zweiter Satz.\n"));
 // Signal end of input:
 controller.close();
 ```
+
+## Browser Demos
+
+| Demo | Datei | Beschreibung |
+|------|-------|-------------|
+| STT | `examples/stt.html` | Mikrofon → WebSocket STT → Transkript-Anzeige |
+| STS | `examples/sts.html` | Mikrofon → STT → TTS → Lautsprecher (Roboterstimme) |
+
+Oeffnen via `https://server/tts/examples/stt.html?api=https://server/tts`
 
 ## License
 

@@ -63,8 +63,7 @@ let audioCtx = null;
 let analyser = null;
 let scriptNode = null;
 let levelRaf = null;
-let streamController = null;  // WritableStream controller for upload
-let responseReader = null;     // ReadableStream reader for NDJSON response
+let ws = null;
 
 function fmtTime(s) {
   const m = Math.floor(s / 60);
@@ -98,34 +97,6 @@ function updateLevel() {
   if (recording) levelRaf = requestAnimationFrame(updateLevel);
 }
 
-// Read NDJSON response in background
-async function readResponse(response) {
-  const reader = response.body.getReader();
-  responseReader = reader;
-  const decoder = new TextDecoder();
-  let buf = '';
-  try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buf += decoder.decode(value, { stream: true });
-      const lines = buf.split('\n');
-      buf = lines.pop();
-      for (const line of lines) {
-        if (!line.trim()) continue;
-        try { addSegment(JSON.parse(line)); } catch (_) {}
-      }
-    }
-    if (buf.trim()) {
-      try { addSegment(JSON.parse(buf)); } catch (_) {}
-    }
-  } catch (e) {
-    if (e.name !== 'AbortError') {
-      statusEl.textContent = 'Lesefehler: ' + e.message;
-    }
-  }
-}
-
 async function start() {
   transcript.innerHTML = '';
   statusEl.textContent = 'Mikrofon wird angefordert...';
@@ -147,57 +118,61 @@ async function start() {
   analyser.fftSize = 512;
   source.connect(analyser);
 
-  // Create a ReadableStream that we push PCM chunks into
-  let controller;
-  const uploadStream = new ReadableStream({
-    start(c) { controller = c; streamController = c; },
-  });
-
-  // Start the fetch with streaming body immediately
+  // Build WebSocket URL from the HTTP API URL
   const api = apiInput.value.replace(/\/+$/, '');
-  const fetchPromise = fetch(api + '/inputstream', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/octet-stream',
-      'X-Sample-Rate': String(nativeRate),
-    },
-    body: uploadStream,
-    duplex: 'half',
-  });
+  const wsUrl = api.replace(/^http/, 'ws') + '/ws/stt';
 
-  // Read response in background as it arrives
-  fetchPromise.then(r => {
-    if (!r.ok) {
-      statusEl.textContent = 'Server-Fehler: ' + r.status;
-      return;
-    }
-    readResponse(r);
-  }).catch(e => {
-    if (e.name !== 'AbortError') {
-      statusEl.textContent = 'Verbindungsfehler: ' + e.message;
-    }
-  });
+  statusEl.textContent = 'Verbinde mit ' + wsUrl + '...';
 
-  // Capture PCM and push into upload stream
-  const bufSize = 4096;
-  scriptNode = audioCtx.createScriptProcessor(bufSize, 1, 1);
-  scriptNode.onaudioprocess = (e) => {
-    if (!recording || !controller) return;
-    const float32 = e.inputBuffer.getChannelData(0);
-    const int16 = new Int16Array(float32.length);
-    for (let i = 0; i < float32.length; i++) {
-      int16[i] = Math.max(-32768, Math.min(32767, Math.round(float32[i] * 32767)));
-    }
-    controller.enqueue(new Uint8Array(int16.buffer));
+  ws = new WebSocket(wsUrl);
+  ws.binaryType = 'arraybuffer';
+
+  ws.onopen = function() {
+    // Send initial config with sample rate
+    ws.send(JSON.stringify({ sampleRate: nativeRate, language: 'de' }));
+
+    // Start capturing PCM audio
+    const bufSize = 4096;
+    scriptNode = audioCtx.createScriptProcessor(bufSize, 1, 1);
+    scriptNode.onaudioprocess = function(e) {
+      if (!recording || !ws || ws.readyState !== WebSocket.OPEN) return;
+      const float32 = e.inputBuffer.getChannelData(0);
+      const int16 = new Int16Array(float32.length);
+      for (let i = 0; i < float32.length; i++) {
+        int16[i] = Math.max(-32768, Math.min(32767, Math.round(float32[i] * 32767)));
+      }
+      ws.send(int16.buffer);
+    };
+    source.connect(scriptNode);
+    scriptNode.connect(audioCtx.destination);
+
+    recording = true;
+    btn.textContent = 'Aufnahme stoppen';
+    btn.classList.add('recording');
+    statusEl.textContent = 'Streaming... (' + nativeRate + ' Hz)';
+    updateLevel();
   };
-  source.connect(scriptNode);
-  scriptNode.connect(audioCtx.destination);
 
-  recording = true;
-  btn.textContent = 'Aufnahme stoppen';
-  btn.classList.add('recording');
-  statusEl.textContent = 'Streaming... (' + nativeRate + ' Hz)';
-  updateLevel();
+  ws.onmessage = function(evt) {
+    if (typeof evt.data === 'string') {
+      if (evt.data === '__END__') {
+        statusEl.textContent = 'Fertig.';
+        return;
+      }
+      try {
+        addSegment(JSON.parse(evt.data));
+      } catch (_) {}
+    }
+  };
+
+  ws.onerror = function() {
+    statusEl.textContent = 'WebSocket-Fehler';
+  };
+
+  ws.onclose = function() {
+    if (recording) stop();
+    statusEl.textContent = 'Verbindung geschlossen.';
+  };
 }
 
 async function stop() {
@@ -211,13 +186,12 @@ async function stop() {
   if (mediaStream) { mediaStream.getTracks().forEach(t => t.stop()); mediaStream = null; }
   if (audioCtx) { audioCtx.close(); audioCtx = null; }
 
-  // Close the upload stream -> server gets EOF -> flushes remaining buffer
-  if (streamController) {
-    try { streamController.close(); } catch (_) {}
-    streamController = null;
+  // Send END sentinel and close WebSocket
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send('__END__');
+    statusEl.textContent = 'Warte auf letzte Ergebnisse...';
+    // Don't close immediately — wait for server's __END__ response
   }
-
-  statusEl.textContent = 'Warte auf letzte Ergebnisse...';
 }
 
 btn.addEventListener('click', () => {

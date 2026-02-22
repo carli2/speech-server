@@ -64,6 +64,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 import mimetypes, os
 
 from flask import Flask, Response, jsonify, request, stream_with_context
+from flask_sock import Sock
 
 # Ensure Piper sources are discoverable if installed from local sources
 import sys as _sys
@@ -131,6 +132,7 @@ def create_app(args: argparse.Namespace) -> Flask:
         default_model_id = prefer if prefer in registry.index else sorted(registry.index.keys())[0]
 
     app = Flask(__name__)
+    sock = Sock(app)
     # Ensure our module logger emits at desired level and propagates to root handler
     try:
         _LOGGER.setLevel(logging.DEBUG if args.debug else logging.INFO)
@@ -805,8 +807,9 @@ def create_app(args: argparse.Namespace) -> Flask:
         src_rate = int(request.headers.get('X-Sample-Rate', 16000))
         model_size = getattr(args, 'whisper_model', 'base')
 
-        # Build pipeline
-        source = PCMInputReader(request.stream)
+        # Use raw WSGI input — Werkzeug returns empty BytesIO() for
+        # chunked requests without Content-Length (browser streaming).
+        source = PCMInputReader(request.environ['wsgi.input'])
         pipeline = source
         if src_rate != 16000:
             pipeline = pipeline.pipe(SampleRateConverter(src_rate, 16000))
@@ -824,7 +827,7 @@ def create_app(args: argparse.Namespace) -> Flask:
         return resp
 
     # ---- Streaming TTS: params via GET, POST body = text stream, response = audio stream ----
-    @app.route("/tts/stream", methods=["POST", "OPTIONS"])
+    @app.route("/tts/stream", methods=["POST", "PUT", "OPTIONS"])
     def tts_stream():
         if request.method == "OPTIONS":
             return ("", 204)
@@ -833,10 +836,19 @@ def create_app(args: argparse.Namespace) -> Flask:
         syn = registry.create_synthesis_config(voice, request.args.to_dict())
 
         def text_lines():
-            """Yield text lines from the streamed POST body."""
+            """Yield text lines from the streamed POST/PUT body."""
+            import os
+            stream = request.environ['wsgi.input']
+            # os.read() on the fd: one syscall, returns all available bytes
+            # immediately (up to 4096), blocks only when nothing is available.
+            try:
+                fd = stream.fileno()
+                use_fd = True
+            except Exception:
+                use_fd = False
             buf = b""
             while True:
-                chunk = request.stream.read(4096)
+                chunk = os.read(fd, 4096) if use_fd else stream.read(1)
                 if not chunk:
                     break
                 buf += chunk
@@ -850,18 +862,138 @@ def create_app(args: argparse.Namespace) -> Flask:
                 yield text
 
         # Pipeline: StreamingTTSProducer -> ResponseWriter
+        # max_chunk_bytes=4800 → ~0.1s chunks at 24kHz/16bit for low-latency playback
         from lib import StreamingTTSProducer, ResponseWriter
         source = StreamingTTSProducer(text_lines(), voice, syn)
-        writer = ResponseWriter(source, est_frames_24k=None)
+        writer = ResponseWriter(source, est_frames_24k=0x3FFFFFFF, max_chunk_bytes=4800)
 
         resp = Response(stream_with_context(writer.stream()), mimetype="audio/wav")
         resp.headers["X-Accel-Buffering"] = "no"
-        try:
-            writer.apply_headers(resp)
-        except Exception:
-            pass
+        resp.headers["Cache-Control"] = "no-cache"
+        # No Content-Length for streaming — forces chunked transfer, prevents client buffering
         resp.call_on_close(lambda: source.cancel())
         return resp
+
+    # ---- WebSocket STT streaming endpoint ----
+    @sock.route("/ws/stt")
+    def ws_stt(ws):
+        """WebSocket STT: client sends PCM audio, server replies with NDJSON text.
+
+        Protocol:
+        - Client → Server: text '{"sampleRate": 48000}' first, then binary PCM s16le mono
+        - Server → Client: text NDJSON lines, text "__END__" when done
+        """
+        from lib import WebSocketReader, SampleRateConverter
+        from lib.WhisperSTT import WhisperTranscriber
+        import json as _json
+
+        model_size = getattr(args, 'whisper_model', 'base')
+
+        # Read initial config message (must be JSON with sampleRate)
+        try:
+            config_msg = ws.receive(timeout=10)
+        except Exception:
+            ws.send(_json.dumps({"error": "No config message received"}))
+            return
+
+        src_rate = 16000
+        chunk_seconds = 2.0
+        language = None
+        if isinstance(config_msg, str):
+            try:
+                config = _json.loads(config_msg)
+                src_rate = int(config.get("sampleRate", 16000))
+                chunk_seconds = max(0.5, min(10.0, float(config.get("chunkSeconds", chunk_seconds))))
+                lang = config.get("language")
+                if lang and isinstance(lang, str) and len(lang) <= 5:
+                    language = lang.strip()
+            except Exception:
+                pass
+
+        reader = WebSocketReader(ws)
+        pipeline = reader
+        if src_rate != 16000:
+            pipeline = pipeline.pipe(SampleRateConverter(src_rate, 16000))
+        pipeline = pipeline.pipe(WhisperTranscriber(model_size, chunk_seconds=chunk_seconds, language=language))
+
+        try:
+            for chunk in pipeline.stream_pcm24k():
+                if reader.cancelled:
+                    break
+                # WhisperTranscriber yields NDJSON bytes (one line per segment)
+                for line in chunk.decode('utf-8', errors='replace').splitlines():
+                    line = line.strip()
+                    if line:
+                        ws.send(line)
+        except Exception as e:
+            _LOGGER.warning("ws_stt error: %s", e)
+        finally:
+            try:
+                ws.send("__END__")
+            except Exception:
+                pass
+
+    # ---- WebSocket TTS streaming endpoint ----
+    @sock.route("/ws/tts")
+    def ws_tts(ws):
+        """WebSocket TTS: client sends text lines, server replies with PCM audio.
+
+        Protocol:
+        - Client → Server: text messages (sentences), "__END__" to signal done
+        - Server → Client: text '{"sample_rate":24000}' once, then binary PCM
+          s16le mono chunks, text "__END__" when done.
+        - Voice via query param: ?voice=de_DE-thorsten-medium
+        """
+        from lib import WebSocketReader, WebSocketWriter, StreamingTTSProducer
+        import json as _json
+
+        model_id = request.args.get("voice", default_model_id)
+        try:
+            voice = registry.ensure_loaded(model_id)
+        except KeyError:
+            ws.send(_json.dumps({"error": f"Voice not found: {model_id}"}))
+            return
+        syn = registry.create_synthesis_config(voice, request.args.to_dict())
+        sample_rate = voice.config.sample_rate
+
+        # Send config message
+        ws.send(_json.dumps({"sample_rate": sample_rate}))
+
+        reader = WebSocketReader(ws)
+        source = StreamingTTSProducer(reader.text_lines(), voice, syn)
+        writer = WebSocketWriter(ws, source, max_chunk_bytes=4800)
+        writer.run()
+
+    # ---- WebSocket TTS streaming endpoint (alternative path) ----
+    @sock.route("/tts/ws")
+    def tts_ws(ws):
+        """WebSocket TTS: client sends text lines, server replies with PCM audio.
+
+        Protocol:
+        - Client → Server: text messages (sentences), "__END__" to signal done
+        - Server → Client: text '{"sample_rate":24000}' once, then binary PCM
+          s16le mono chunks, text "__END__" when done.
+        - Voice via query param: ?voice=de_DE-thorsten-medium
+        """
+        from lib import WebSocketReader, WebSocketWriter, StreamingTTSProducer
+        import json as _json
+
+        model_id = request.args.get("voice", default_model_id)
+        try:
+            voice = registry.ensure_loaded(model_id)
+        except KeyError:
+            ws.send(_json.dumps({"error": f"Voice not found: {model_id}"}))
+            return
+        syn = registry.create_synthesis_config(voice, request.args.to_dict())
+        sample_rate = voice.config.sample_rate
+
+        # Send config message
+        ws.send(_json.dumps({"sample_rate": sample_rate}))
+
+        reader = WebSocketReader(ws)
+        source = StreamingTTSProducer(reader.text_lines(), voice, syn)
+        writer = WebSocketWriter(ws, source, max_chunk_bytes=4800)
+        writer.run()
 
     return app
 

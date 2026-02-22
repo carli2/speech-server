@@ -72,11 +72,12 @@ class WhisperTranscriber(Stage):
     """
 
     def __init__(self, model_size: str = "base", chunk_seconds: float = 3.0,
-                 sample_rate: int = 16000) -> None:
+                 sample_rate: int = 16000, language: Optional[str] = None) -> None:
         super().__init__()
         self.model_size = model_size
         self.chunk_seconds = chunk_seconds
         self.sample_rate = sample_rate
+        self.language = language
 
     def stream_pcm24k(self) -> Iterator[bytes]:
         """Yields NDJSON lines (as bytes) instead of PCM.
@@ -93,6 +94,7 @@ class WhisperTranscriber(Stage):
         buf = b""
         time_offset = 0.0
 
+        _LOGGER.info("WhisperTranscriber: waiting for upstream data (chunk_bytes=%d)", chunk_bytes)
         for pcm in self.upstream.stream_pcm24k():
             if self.cancelled:
                 break
@@ -100,19 +102,23 @@ class WhisperTranscriber(Stage):
             while len(buf) >= chunk_bytes:
                 segment_audio = buf[:chunk_bytes]
                 buf = buf[chunk_bytes:]
+                _LOGGER.info("transcribing chunk at offset=%.1fs (%d bytes)", time_offset, len(segment_audio))
                 for line in self._transcribe_chunk(model, segment_audio, time_offset):
+                    _LOGGER.info("result: %s", line.decode().strip())
                     yield line
                 time_offset += self.chunk_seconds
 
         # Flush remaining
         if buf and not self.cancelled:
+            _LOGGER.info("flushing remaining %d bytes at offset=%.1fs", len(buf), time_offset)
             for line in self._transcribe_chunk(model, buf, time_offset):
+                _LOGGER.info("result: %s", line.decode().strip())
                 yield line
 
     def _transcribe_chunk(self, model, pcm_bytes: bytes, time_offset: float) -> Iterator[bytes]:
         import numpy as np
         samples = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32) / 32768.0
-        segments, _ = model.transcribe(samples, language=None, beam_size=5,
+        segments, _ = model.transcribe(samples, language=self.language, beam_size=5,
                                        vad_filter=True)
         for seg in segments:
             text = seg.text.strip()

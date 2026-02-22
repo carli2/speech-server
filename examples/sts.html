@@ -1,0 +1,282 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<title>Speech-to-Speech Demo</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: system-ui, sans-serif; background: #1a1a2e; color: #e0e0e0; display: flex; justify-content: center; padding: 2rem; }
+  .card { background: #16213e; border-radius: 12px; padding: 2rem; max-width: 560px; width: 100%; box-shadow: 0 4px 24px rgba(0,0,0,.4); }
+  h1 { font-size: 1.4rem; margin-bottom: 1.2rem; color: #a8d8ea; }
+  label { display: block; font-size: .85rem; color: #8899aa; margin-bottom: .3rem; }
+  input[type=text], select {
+    width: 100%; padding: .5rem .8rem; border: 1px solid #2a3a5c; border-radius: 6px;
+    background: #0f3460; color: #e0e0e0; font-size: .9rem; margin-bottom: 1rem;
+  }
+  button {
+    width: 100%; padding: .8rem; border: none; border-radius: 6px;
+    font-size: 1rem; font-weight: 600; cursor: pointer; transition: background .2s;
+  }
+  #btn-rec { background: #e94560; color: #fff; }
+  #btn-rec:hover { background: #c73e54; }
+  #btn-rec.recording { background: #28a745; }
+  #btn-rec.recording:hover { background: #218838; }
+  #level-bar { margin-top: 1rem; height: 6px; border-radius: 3px; background: #0f3460; overflow: hidden; }
+  #level-fill { height: 100%; width: 0%; background: #e94560; transition: width 60ms; }
+  #transcript {
+    margin-top: 1.2rem; min-height: 120px; max-height: 300px; overflow-y: auto;
+    background: #0f3460; border-radius: 6px; padding: 1rem; font-size: .95rem;
+    line-height: 1.5; white-space: pre-wrap; word-break: break-word;
+  }
+  #transcript:empty::before { content: 'Sprich etwas — Text und Roboterstimme kommen hier...'; color: #556; }
+  #status { margin-top: .8rem; font-size: .85rem; color: #8899aa; min-height: 1.2em; }
+  .seg { color: #e0e0e0; }
+  .seg .time { color: #5588aa; font-size: .8rem; margin-right: .4rem; }
+  .seg .speaking { color: #28a745; font-size: .8rem; margin-left: .4rem; }
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>Speech-to-Speech (Roboterstimme)</h1>
+
+  <label for="api-url">Server-URL</label>
+  <input type="text" id="api-url" value="https://srv.launix.de/tts">
+
+  <label for="voice">Stimme</label>
+  <input type="text" id="voice" value="de_DE-thorsten-medium">
+
+  <button id="btn-rec">Aufnahme starten</button>
+  <div id="level-bar"><div id="level-fill"></div></div>
+  <div id="transcript"></div>
+  <div id="status"></div>
+</div>
+
+<script>
+var apiInput   = document.getElementById('api-url');
+var voiceInput = document.getElementById('voice');
+var btn        = document.getElementById('btn-rec');
+var transcript = document.getElementById('transcript');
+var statusEl   = document.getElementById('status');
+var levelFill  = document.getElementById('level-fill');
+
+var params = new URLSearchParams(location.search);
+if (params.get('api')) apiInput.value = params.get('api');
+if (params.get('voice')) voiceInput.value = params.get('voice');
+
+var recording = false;
+var mediaStream = null;
+var audioCtx = null;
+var analyser = null;
+var scriptNode = null;
+var levelRaf = null;
+var sttWs = null;
+var ttsWs = null;
+
+// -- TTS playback state --
+var ttsSampleRate = 24000;
+var playCtx = null;       // AudioContext for playback
+var nextPlayTime = 0;     // scheduled time for next chunk
+
+function fmtTime(s) {
+  var m = Math.floor(s / 60);
+  var sec = (s % 60).toFixed(1);
+  return m > 0 ? m + ':' + sec.padStart(4, '0') : sec + 's';
+}
+
+function addSegment(seg, extra) {
+  var div = document.createElement('div');
+  div.className = 'seg';
+  var timeSpan = document.createElement('span');
+  timeSpan.className = 'time';
+  timeSpan.textContent = '[' + fmtTime(seg.start) + '-' + fmtTime(seg.end) + ']';
+  div.appendChild(timeSpan);
+  div.appendChild(document.createTextNode(seg.text));
+  if (extra) {
+    var sp = document.createElement('span');
+    sp.className = 'speaking';
+    sp.textContent = extra;
+    div.appendChild(sp);
+  }
+  transcript.appendChild(div);
+  transcript.scrollTop = transcript.scrollHeight;
+}
+
+function updateLevel() {
+  if (!analyser) return;
+  var buf = new Uint8Array(analyser.fftSize);
+  analyser.getByteTimeDomainData(buf);
+  var sum = 0;
+  for (var i = 0; i < buf.length; i++) {
+    var v = (buf[i] - 128) / 128;
+    sum += v * v;
+  }
+  var rms = Math.sqrt(sum / buf.length);
+  levelFill.style.width = Math.min(100, rms * 400) + '%';
+  if (recording) levelRaf = requestAnimationFrame(updateLevel);
+}
+
+function playPcmChunk(pcmBuf) {
+  if (!playCtx) {
+    playCtx = new AudioContext({ sampleRate: ttsSampleRate });
+  }
+  var int16 = new Int16Array(pcmBuf);
+  var float32 = new Float32Array(int16.length);
+  for (var i = 0; i < int16.length; i++) {
+    float32[i] = int16[i] / 32768.0;
+  }
+  var audioBuf = playCtx.createBuffer(1, float32.length, ttsSampleRate);
+  audioBuf.getChannelData(0).set(float32);
+  var src = playCtx.createBufferSource();
+  src.buffer = audioBuf;
+  src.connect(playCtx.destination);
+  var now = playCtx.currentTime;
+  if (nextPlayTime < now) nextPlayTime = now;
+  src.start(nextPlayTime);
+  nextPlayTime += audioBuf.duration;
+}
+
+function connectTts() {
+  var api = apiInput.value.replace(/\/+$/, '');
+  var voice = voiceInput.value.trim() || 'de_DE-thorsten-medium';
+  var wsUrl = api.replace(/^http/, 'ws') + '/ws/tts?voice=' + encodeURIComponent(voice);
+
+  ttsWs = new WebSocket(wsUrl);
+  ttsWs.binaryType = 'arraybuffer';
+
+  ttsWs.onmessage = function(evt) {
+    if (typeof evt.data === 'string') {
+      if (evt.data === '__END__') return;
+      // Config message with sample_rate
+      try {
+        var cfg = JSON.parse(evt.data);
+        if (cfg.sample_rate) ttsSampleRate = cfg.sample_rate;
+      } catch (_) {}
+      return;
+    }
+    // Binary PCM → play
+    playPcmChunk(evt.data);
+  };
+
+  ttsWs.onerror = function() {
+    statusEl.textContent = 'TTS WebSocket-Fehler';
+  };
+
+  return new Promise(function(resolve) {
+    ttsWs.onopen = function() { resolve(); };
+  });
+}
+
+async function start() {
+  transcript.innerHTML = '';
+  statusEl.textContent = 'Mikrofon wird angefordert...';
+  nextPlayTime = 0;
+
+  try {
+    mediaStream = await navigator.mediaDevices.getUserMedia({
+      audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true }
+    });
+  } catch (e) {
+    statusEl.textContent = 'Mikrofon-Zugriff verweigert: ' + e.message;
+    return;
+  }
+
+  audioCtx = new AudioContext();
+  var nativeRate = audioCtx.sampleRate;
+  var source = audioCtx.createMediaStreamSource(mediaStream);
+
+  analyser = audioCtx.createAnalyser();
+  analyser.fftSize = 512;
+  source.connect(analyser);
+
+  // Connect TTS WebSocket first
+  statusEl.textContent = 'Verbinde TTS...';
+  await connectTts();
+
+  // Connect STT WebSocket
+  var api = apiInput.value.replace(/\/+$/, '');
+  var sttUrl = api.replace(/^http/, 'ws') + '/ws/stt';
+
+  statusEl.textContent = 'Verbinde STT...';
+  sttWs = new WebSocket(sttUrl);
+  sttWs.binaryType = 'arraybuffer';
+
+  sttWs.onopen = function() {
+    // Send config with sample rate
+    sttWs.send(JSON.stringify({ sampleRate: nativeRate, chunkSeconds: 2.0, language: 'de' }));
+
+    // Start capturing PCM
+    var bufSize = 4096;
+    scriptNode = audioCtx.createScriptProcessor(bufSize, 1, 1);
+    scriptNode.onaudioprocess = function(e) {
+      if (!recording || !sttWs || sttWs.readyState !== WebSocket.OPEN) return;
+      var float32 = e.inputBuffer.getChannelData(0);
+      var int16 = new Int16Array(float32.length);
+      for (var i = 0; i < float32.length; i++) {
+        int16[i] = Math.max(-32768, Math.min(32767, Math.round(float32[i] * 32767)));
+      }
+      sttWs.send(int16.buffer);
+    };
+    source.connect(scriptNode);
+    scriptNode.connect(audioCtx.destination);
+
+    recording = true;
+    btn.textContent = 'Aufnahme stoppen';
+    btn.classList.add('recording');
+    statusEl.textContent = 'Streaming... (' + nativeRate + ' Hz → STT → TTS)';
+    updateLevel();
+  };
+
+  sttWs.onmessage = function(evt) {
+    if (typeof evt.data === 'string') {
+      if (evt.data === '__END__') {
+        // STT done → close TTS
+        if (ttsWs && ttsWs.readyState === WebSocket.OPEN) {
+          ttsWs.send('__END__');
+        }
+        statusEl.textContent = 'Fertig.';
+        return;
+      }
+      try {
+        var seg = JSON.parse(evt.data);
+        addSegment(seg, '▶');
+        // Forward recognized text to TTS
+        if (ttsWs && ttsWs.readyState === WebSocket.OPEN && seg.text) {
+          ttsWs.send(seg.text);
+        }
+      } catch (_) {}
+    }
+  };
+
+  sttWs.onerror = function() {
+    statusEl.textContent = 'STT WebSocket-Fehler';
+  };
+
+  sttWs.onclose = function() {
+    if (recording) stop();
+  };
+}
+
+async function stop() {
+  recording = false;
+  btn.textContent = 'Aufnahme starten';
+  btn.classList.remove('recording');
+  levelFill.style.width = '0%';
+  if (levelRaf) cancelAnimationFrame(levelRaf);
+  if (scriptNode) { scriptNode.disconnect(); scriptNode = null; }
+  if (analyser) { analyser.disconnect(); analyser = null; }
+  if (mediaStream) { mediaStream.getTracks().forEach(function(t) { t.stop(); }); mediaStream = null; }
+  if (audioCtx) { audioCtx.close(); audioCtx = null; }
+
+  // Signal end to STT
+  if (sttWs && sttWs.readyState === WebSocket.OPEN) {
+    sttWs.send('__END__');
+    statusEl.textContent = 'Warte auf letzte Ergebnisse...';
+  }
+}
+
+btn.addEventListener('click', function() {
+  if (recording) stop(); else start();
+});
+</script>
+</body>
+</html>

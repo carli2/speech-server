@@ -1,5 +1,6 @@
 # Web server
 Flask>=2.3
+flask-sock>=0.7
 
 # ONNX runtime for Piper voices (choose GPU variant manually if desired)
 onnxruntime>=1.16

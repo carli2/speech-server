@@ -7,10 +7,11 @@ from .base import Stage
 
 
 class ResponseWriter(Stage):
-    def __init__(self, upstream: Stage, est_frames_24k: Optional[int]) -> None:
+    def __init__(self, upstream: Stage, est_frames_24k: Optional[int], max_chunk_bytes: Optional[int] = None) -> None:
         super().__init__()
         self.upstream = upstream
         self.est_frames = est_frames_24k
+        self.max_chunk_bytes = max_chunk_bytes
 
     def estimate_frames_24k(self) -> Optional[int]:
         return self.est_frames if self.est_frames is not None else (
@@ -57,7 +58,14 @@ class ResponseWriter(Stage):
             total += len(pcm)
             log.debug("writer: chunk=%d bytes=%d total=%d", chunk_idx, len(pcm), total)
             try:
-                yield pcm
+                if self.max_chunk_bytes and len(pcm) > self.max_chunk_bytes:
+                    while len(pcm) > self.max_chunk_bytes:
+                        yield pcm[:self.max_chunk_bytes]
+                        pcm = pcm[self.max_chunk_bytes:]
+                    if pcm:
+                        yield pcm
+                else:
+                    yield pcm
             except (GeneratorExit, BrokenPipeError):
                 log.info("writer: downstream closed at chunk=%d total=%d; cancelling pipeline", chunk_idx, total)
                 self.cancel()
