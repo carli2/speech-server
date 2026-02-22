@@ -52,6 +52,47 @@ pip install -r requirements.txt
 pip install -e /path/to/piper  # Piper from source
 ```
 
+## Voice Models
+
+Voice models (`.onnx` files) are not included in this repository. Place them in the `voices-piper/` directory (or specify a custom path with `--voices-path`).
+
+### Download from Piper releases
+
+Browse available voices at https://github.com/rhasspy/piper/blob/master/VOICES.md
+
+```bash
+# Example: German voice (Thorsten, medium quality)
+mkdir -p voices-piper
+cd voices-piper
+wget https://github.com/rhasspy/piper/releases/download/2023.11.14-2/voice-de_DE-thorsten-medium.tar.gz
+tar xzf voice-de_DE-thorsten-medium.tar.gz
+# This extracts de_DE-thorsten-medium.onnx and de_DE-thorsten-medium.onnx.json
+
+# Example: English voice (Amy, medium quality)
+wget https://github.com/rhasspy/piper/releases/download/2023.11.14-2/voice-en_US-amy-medium.tar.gz
+tar xzf voice-en_US-amy-medium.tar.gz
+```
+
+### Direct download via URL
+
+Each voice consists of two files: the ONNX model and its JSON config.
+
+```bash
+cd voices-piper
+
+# German - Thorsten (medium)
+wget https://huggingface.co/rhasspy/piper-voices/resolve/main/de/de_DE/thorsten/medium/de_DE-thorsten-medium.onnx
+wget https://huggingface.co/rhasspy/piper-voices/resolve/main/de/de_DE/thorsten/medium/de_DE-thorsten-medium.onnx.json
+
+# English - Amy (medium)
+wget https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/amy/medium/en_US-amy-medium.onnx
+wget https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/amy/medium/en_US-amy-medium.onnx.json
+```
+
+Voice files follow the naming convention `{lang}_{REGION}-{name}-{quality}.onnx` where quality is one of `x_low`, `low`, `medium`, or `high`. Higher quality models are larger and slower but sound better.
+
+The server auto-discovers all `.onnx` files in the voices directory on startup. Use `GET /voices` to list loaded voices.
+
 ## Usage
 
 ```bash
