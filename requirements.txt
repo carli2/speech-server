@@ -1,0 +1,19 @@
+# Web server
+Flask>=2.3
+
+# ONNX runtime for Piper voices (choose GPU variant manually if desired)
+onnxruntime>=1.16
+# Numeric utils for F0 estimation (let pip resolve version via TTS/onnxruntime)
+# numpy
+# onnxruntime-gpu  # optional: install instead if using CUDA
+
+# Optional: FreeVC voice conversion via Coqui TTS (requires PyTorch)
+# Installed automatically when Python < 3.12
+TTS>=0.22; python_version < "3.12"
+torch>=2.1; python_version < "3.12"
+
+# Note:
+# - Install Piper (Python bindings) from your local sources (not from PyPI):
+#     pip install -e /home/carli/sources/piper
+# - System dependency: espeak-ng (Debian/Ubuntu)
+#     sudo apt-get install espeak-ng
