@@ -7,7 +7,7 @@ import wave as _wave
 from pathlib import Path
 from typing import Iterator, Optional, Any, Callable
 
-from .base import Stage
+from .base import AudioFormat, Stage
 from .util import estimate_f0_avg, ffmpeg_to_pcm16, read_wav_all_samples
 from .FileFetcher import FileFetcher
 
@@ -30,6 +30,8 @@ class PitchAdjuster(Stage):
         self.applied_st: Optional[float] = None
         self._target_local: Optional[Path] = None
         self.f0_t: Optional[float] = None
+        self.input_format = AudioFormat(24000, "s16le")
+        self.output_format = AudioFormat(24000, "s16le")
         try:
             p = self._ensure_target_local()
             if p:

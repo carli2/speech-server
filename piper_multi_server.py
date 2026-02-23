@@ -59,6 +59,7 @@ import argparse
 import json
 import logging
 import re
+import threading
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 import mimetypes, os
@@ -963,6 +964,59 @@ def create_app(args: argparse.Namespace) -> Flask:
         source = StreamingTTSProducer(reader.text_lines(), voice, syn)
         writer = WebSocketWriter(ws, source, max_chunk_bytes=4800)
         writer.run()
+
+    # ---- Generic pipeline endpoint ----
+    @sock.route("/ws/pipe")
+    def ws_pipe(ws):
+        """Generic pipeline endpoint: client sends JSON config, then data flows.
+
+        Protocol:
+        - Client -> Server: first message is JSON config:
+            {"pipe": "ws:pcm | resample:48000:16000 | stt:de | ws:ndjson"}
+          or for duplex:
+            {"pipes": ["sip:100@pbx | resample:8000:16000 | stt:de | ws:ndjson",
+                        "ws:text | tts:de_DE-thorsten-medium | resample:24000:8000 | sip:100@pbx"]}
+        - Then data flows according to the pipeline definition.
+        """
+        from lib.PipelineBuilder import PipelineBuilder
+        import json as _json
+
+        try:
+            config_msg = ws.receive(timeout=10)
+        except Exception:
+            ws.send(_json.dumps({"error": "No config message received"}))
+            return
+
+        try:
+            config = _json.loads(config_msg)
+        except Exception:
+            ws.send(_json.dumps({"error": "Invalid JSON config"}))
+            return
+
+        builder = PipelineBuilder(ws, registry, args)
+
+        try:
+            if "pipe" in config:
+                run = builder.build(config["pipe"])
+                run.run()
+            elif "pipes" in config:
+                runs = builder.build_multi(config["pipes"])
+                if len(runs) == 1:
+                    runs[0].run()
+                else:
+                    threads = [threading.Thread(target=r.run, daemon=True) for r in runs]
+                    for t in threads:
+                        t.start()
+                    for t in threads:
+                        t.join()
+            else:
+                ws.send(_json.dumps({"error": "Config must contain 'pipe' or 'pipes'"}))
+        except Exception as e:
+            _LOGGER.warning("ws_pipe error: %s", e)
+            try:
+                ws.send(_json.dumps({"error": str(e)}))
+            except Exception:
+                pass
 
     # ---- WebSocket TTS streaming endpoint (alternative path) ----
     @sock.route("/tts/ws")

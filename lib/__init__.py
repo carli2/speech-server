@@ -1,4 +1,5 @@
-from .base import Stage
+from .base import Stage, AudioFormat
+from .EncodingConverter import EncodingConverter
 from .AudioReader import AudioReader
 from .TTSProducer import TTSProducer
 from .VCConverter import VCConverter
@@ -12,6 +13,21 @@ from .SampleRateConverter import SampleRateConverter
 from .WhisperSTT import WhisperTranscriber
 from .WebSocketReader import WebSocketReader
 from .WebSocketWriter import WebSocketWriter
+from .NdjsonToText import NdjsonToText
+from .CLIReader import CLIReader
+from .CLIWriter import CLIWriter
+from .PipelineBuilder import PipelineBuilder
+from .AudioSocketSession import AudioSocketSession
+from .AudioSocketSource import AudioSocketSource
+from .AudioSocketSink import AudioSocketSink
+
+# Optional: SIP stages (require pyVoIP)
+try:
+    from .SIPSession import SIPSession
+    from .SIPSource import SIPSource
+    from .SIPSink import SIPSink
+except Exception:
+    pass
 
 # Optional convenience re-exports for TTS registry
 try:

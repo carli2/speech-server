@@ -6,7 +6,7 @@ import wave as _wave
 from pathlib import Path
 from typing import Callable, Iterator, Optional, Any
 
-from .base import Stage
+from .base import AudioFormat, Stage
 from .util import ffmpeg_to_pcm16
 from .vc_service import get_freevc_model, conversion_lock
 from .FileFetcher import FileFetcher
@@ -20,6 +20,8 @@ class VCConverter(Stage):
         self._vc_model = None
         self._target_local: Optional[Path] = None
         self._bearer = bearer
+        self.input_format = AudioFormat(24000, "s16le")
+        self.output_format = AudioFormat(24000, "s16le")
 
     def _ensure_internal_model(self):
         if self._vc_model is not None:

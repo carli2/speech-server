@@ -12,6 +12,11 @@ class ResponseWriter(Stage):
         self.upstream = upstream
         self.est_frames = est_frames_24k
         self.max_chunk_bytes = max_chunk_bytes
+        # Derive sample rate from upstream if available, else 24000
+        if upstream and upstream.output_format and upstream.output_format.sample_rate > 0:
+            self.sample_rate = upstream.output_format.sample_rate
+        else:
+            self.sample_rate = 24000
 
     def estimate_frames_24k(self) -> Optional[int]:
         return self.est_frames if self.est_frames is not None else (
@@ -20,9 +25,10 @@ class ResponseWriter(Stage):
 
     def stream(self) -> Iterator[bytes]:
         log = logging.getLogger("piper-multi-server")
+        sr = self.sample_rate
         est_frames = self.estimate_frames_24k()
         if est_frames is None or est_frames <= 0:
-            est_frames = int(30 * 24000)
+            est_frames = int(30 * sr)
         else:
             est_frames = int(est_frames)
 
@@ -38,8 +44,8 @@ class ResponseWriter(Stage):
             + (16).to_bytes(4, "little")
             + (1).to_bytes(2, "little")
             + (1).to_bytes(2, "little")
-            + (24000).to_bytes(4, "little")
-            + (24000 * 2).to_bytes(4, "little")
+            + sr.to_bytes(4, "little")
+            + (sr * 2).to_bytes(4, "little")
             + (2).to_bytes(2, "little")
             + (16).to_bytes(2, "little")
             + b"data"
@@ -108,7 +114,7 @@ class ResponseWriter(Stage):
             try:
                 est_frames = self.estimate_frames_24k()
                 if est_frames is None or est_frames <= 0:
-                    est_frames = int(30 * 24000)
+                    est_frames = int(30 * self.sample_rate)
                 else:
                     est_frames = int(est_frames)
                 est_bytes_nominal = max(0, int(est_frames * 2 * 1.05))

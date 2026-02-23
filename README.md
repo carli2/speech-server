@@ -14,6 +14,7 @@ Multi-voice TTS/STT HTTP server with realtime streaming, voice conversion, and p
 - **Streaming STT** (`POST /inputstream`) — PCM audio in via request body, NDJSON transcription out, single HTTP connection
 - **WebSocket STT** (`/ws/stt`) — PCM audio in via WebSocket binary frames, NDJSON text out. Works through Apache `mod_proxy_wstunnel` and in all browsers (Chrome, Firefox, Safari)
 - **WebSocket TTS** (`/ws/tts`) — text in via WebSocket text frames, PCM audio out as binary frames. Works through Apache `mod_proxy_wstunnel` and in all browsers
+- **SIP bridge** — dial into Asterisk conferences as a bot with full-duplex STT/TTS
 
 ## Architecture
 
@@ -22,6 +23,8 @@ The server uses a pipeline of composable stages that process audio as a stream o
 ```
 Source ──► Processor ──► Processor ──► Sink
 ```
+
+Format conversion between stages is automatic: `.pipe()` inserts `SampleRateConverter` and `EncodingConverter` stages when the output format of one stage doesn't match the input format of the next.
 
 ### Example pipelines
 
@@ -33,7 +36,8 @@ POST /inputstream   STT (16kHz):    PCMInputReader ──► WhisperTranscriber 
 POST /inputstream   STT (48kHz):    PCMInputReader ──► SampleRateConverter(48k→16k) ──► WhisperTranscriber ──► NDJSON
 WS   /ws/stt        STT (WebSocket): WebSocketReader ──► SampleRateConverter ──► WhisperTranscriber ──► ws.send(NDJSON)
 WS   /ws/tts        TTS (WebSocket): WebSocketReader.text_lines() ──► StreamingTTSProducer ──► WebSocketWriter
-                    SIP (planned):  SIPSource ──► SampleRateConverter ──► WhisperTranscriber ──► [LLM] ──► TTSProducer ──► SIPSink
+WS   /ws/pipe       Generic:        DSL-defined pipeline (e.g. ws:pcm | resample:48000:16000 | stt:de | ws:ndjson)
+                    SIP-Bridge:     sip:100@pbx | resample:8000:16000 | stt:de | ws:ndjson
 ```
 
 ### All Stages
@@ -42,70 +46,80 @@ WS   /ws/tts        TTS (WebSocket): WebSocketReader.text_lines() ──► Stre
 
 | Stage | File | Status | Description |
 |-------|------|--------|-------------|
-| `TTSProducer` | `lib/TTSProducer.py` | vorhanden | Text (fester String) zu PCM via Piper ONNX. Streamt satzweise. |
-| `StreamingTTSProducer` | `lib/StreamingTTSProducer.py` | vorhanden | Text (Iterable von Zeilen) zu PCM via Piper ONNX. Synthetisiert jede Zeile sobald sie ankommt — fuer `/tts/stream` und SIP. |
-| `AudioReader` | `lib/AudioReader.py` | vorhanden | Liest Audio aus Datei/URL via ffmpeg, gibt PCM 24kHz s16le mono aus. Bearer-Auth fuer Remote-Dateien. |
-| `PCMInputReader` | `lib/PCMInputReader.py` | vorhanden | Liest rohe PCM-Bytes aus einem Stream (z.B. HTTP Request Body, Mikrofon-Input). |
-| `WebSocketReader` | `lib/WebSocketReader.py` | vorhanden | Liest binary oder text Messages aus einem flask-sock WebSocket. `stream_pcm24k()` fuer PCM-Bytes (STT), `text_lines()` fuer Text (TTS). |
-| `SIPSource` | -- | **geplant** | Empfaengt RTP-Audio aus einem SIP-Call als PCM-Stream. Registriert sich als SIP-User-Agent via PJSIP oder baresip. |
+| `TTSProducer` | `lib/TTSProducer.py` | done | Fixed text string to PCM via Piper ONNX. Streams sentence by sentence at native sample rate. |
+| `StreamingTTSProducer` | `lib/StreamingTTSProducer.py` | done | Text iterable (lines) to PCM via Piper ONNX. Synthesizes each line as it arrives — for `/tts/stream` and SIP. Outputs at native sample rate. |
+| `AudioReader` | `lib/AudioReader.py` | done | Reads audio from file/URL via ffmpeg, outputs PCM 24kHz s16le mono. Bearer auth for remote files. |
+| `PCMInputReader` | `lib/PCMInputReader.py` | done | Reads raw PCM bytes from a stream (e.g. HTTP request body, microphone input). |
+| `WebSocketReader` | `lib/WebSocketReader.py` | done | Reads binary or text messages from a flask-sock WebSocket. `stream_pcm24k()` for PCM bytes (STT), `text_lines()` for text (TTS). |
+| `SIPSource` | `lib/SIPSource.py` | done | Receives RTP audio from a SIP call as PCM stream via pyVoIP. |
+| `CLIReader` | `lib/CLIReader.py` | done | Reads text lines from stdin. For CLI tools (e.g. `sip_bridge.py`). |
 
 #### Processors (transform PCM, have upstream)
 
 | Stage | File | Status | Description |
 |-------|------|--------|-------------|
-| `VCConverter` | `lib/VCConverter.py` | vorhanden | Voice Conversion via FreeVC (Coqui TTS). Aendert Klangfarbe auf Zielstimme. Passthrough wenn FreeVC nicht installiert. |
-| `PitchAdjuster` | `lib/PitchAdjuster.py` | vorhanden | Pitch-Shifting via ffmpeg rubberband (formant-erhaltend). Auto-Schaetzung aus Source/Target-F0 oder expliziter Semitone-Override. |
-| `SampleRateConverter` | `lib/SampleRateConverter.py` | vorhanden | Resampling zwischen beliebigen Sample-Raten via ffmpeg (z.B. 48kHz Browser → 16kHz fuer Whisper). No-op wenn Raten gleich. |
-| `NoiseGate` | -- | **geplant** | Entfernt Stille/Rauschen aus dem Stream, spart Whisper-Rechenzeit. |
-| `AudioMixer` | -- | **geplant** | Mischt mehrere PCM-Streams (z.B. fuer SIP-Konferenzen). |
+| `VCConverter` | `lib/VCConverter.py` | done | Voice conversion via FreeVC (Coqui TTS). Changes timbre to target voice. Passthrough if FreeVC not installed. |
+| `PitchAdjuster` | `lib/PitchAdjuster.py` | done | Pitch shifting via ffmpeg rubberband (formant-preserving). Auto-estimation from source/target F0 or explicit semitone override. |
+| `SampleRateConverter` | `lib/SampleRateConverter.py` | done | Resampling between arbitrary sample rates via audioop (zero-latency, no subprocess). No-op when rates match. |
+| `EncodingConverter` | `lib/EncodingConverter.py` | done | Converts between audio encodings (s16le ↔ u8). Auto-inserted by `pipe()`. |
+| `NoiseGate` | -- | **planned** | Removes silence/noise from the stream, reduces Whisper compute. |
+| `AudioMixer` | -- | **planned** | Mixes multiple PCM streams (e.g. for SIP conferences). |
 
 #### Sinks (consume PCM, produce output)
 
 | Stage | File | Status | Description |
 |-------|------|--------|-------------|
-| `ResponseWriter` | `lib/ResponseWriter.py` | vorhanden | Streamt PCM als WAV-HTTP-Response mit korrekten Headern und Content-Length-Schaetzung. |
-| `RawResponseWriter` | `lib/RawResponseWriter.py` | vorhanden | Roher Datei-Passthrough (kein Resampling, kein WAV-Header). |
-| `WhisperTranscriber` | `lib/WhisperSTT.py` | vorhanden | Nimmt PCM-Stream entgegen, transkribiert in 3-Sekunden-Chunks via faster-whisper, gibt NDJSON-Segmente aus (`{text, start, end}`). Lazy Model-Loading, CPU/CUDA Auto-Detect mit Fallback. |
-| `WebSocketWriter` | `lib/WebSocketWriter.py` | vorhanden | Liest PCM von upstream, sendet als binary WebSocket-Messages (chunked). Sendet `__END__` zum Abschluss. |
-| `SIPSink` | -- | **geplant** | Sendet PCM-Audio als RTP-Pakete in einen SIP-Call. Gegenstueck zu SIPSource. |
+| `ResponseWriter` | `lib/ResponseWriter.py` | done | Streams PCM as WAV HTTP response with correct headers and Content-Length estimation. Derives sample rate from upstream. |
+| `RawResponseWriter` | `lib/RawResponseWriter.py` | done | Raw file passthrough (no resampling, no WAV header). |
+| `WhisperTranscriber` | `lib/WhisperSTT.py` | done | Consumes PCM stream, transcribes in 3-second chunks via faster-whisper, outputs NDJSON segments (`{text, start, end}`). Lazy model loading, CPU/CUDA auto-detect with fallback. |
+| `WebSocketWriter` | `lib/WebSocketWriter.py` | done | Reads PCM from upstream, sends as binary WebSocket messages (chunked). Sends `__END__` on completion. |
+| `SIPSink` | `lib/SIPSink.py` | done | Writes PCM audio as RTP packets into a SIP call via pyVoIP. Counterpart to SIPSource. |
+| `CLIWriter` | `lib/CLIWriter.py` | done | Writes NDJSON lines or text to stdout. For CLI tools (e.g. `sip_bridge.py`). |
 
-#### Services & Utilities (keine Stages, aber von Stages genutzt)
+#### Adapters (not stages, but used by the pipeline)
 
 | Component | File | Status | Description |
 |-----------|------|--------|-------------|
-| `WhisperSTT` | `lib/WhisperSTT.py` | vorhanden | Singleton-Wrapper um faster-whisper. Lazy Loading, CUDA/CPU Auto-Detect, Resampling auf 16kHz. Wird von WhisperTranscriber genutzt. |
-| `FileFetcher` | `lib/FileFetcher.py` | vorhanden | Download von HTTP(S)-URLs oder lokalen Dateien. Bearer-Auth. Genutzt von AudioReader und VCConverter. |
-| `FreeVCService` | `lib/vc_service.py` | vorhanden | Singleton FreeVC-Modell-Manager. CPU/CUDA Auto-Detect. Intern von VCConverter genutzt. |
-| `TTSRegistry` | `lib/registry.py` | vorhanden | Voice-Discovery, Caching und Lazy Loading fuer Piper ONNX-Modelle. |
+| `NdjsonToText` | `lib/NdjsonToText.py` | done | Iterator adapter: extracts `.text` from NDJSON bytes (e.g. WhisperTranscriber output) for STT→TTS transitions. |
+| `PipelineBuilder` | `lib/PipelineBuilder.py` | done | DSL parser and stage wiring for `/ws/pipe`. Builds pipelines from text descriptions. |
 
-### Geplant: SIP-Integration
+#### Services & Utilities (not stages, but used by stages)
 
-Ziel: Der Server kann sich in SIP-Calls einwaehlen und dort als Gespraechspartner agieren (Vollduplex).
+| Component | File | Status | Description |
+|-----------|------|--------|-------------|
+| `WhisperSTT` | `lib/WhisperSTT.py` | done | Singleton wrapper around faster-whisper. Lazy loading, CUDA/CPU auto-detect, resampling to 16kHz. Used by WhisperTranscriber. |
+| `FileFetcher` | `lib/FileFetcher.py` | done | Downloads HTTP(S) URLs or local files. Bearer auth. Used by AudioReader and VCConverter. |
+| `FreeVCService` | `lib/vc_service.py` | done | Singleton FreeVC model manager. CPU/CUDA auto-detect. Used internally by VCConverter. |
+| `TTSRegistry` | `lib/registry.py` | done | Voice discovery, caching and lazy loading for Piper ONNX models. |
+| `SIPSession` | `lib/SIPSession.py` | done | pyVoIP lifecycle manager: registers SIP account, dials call, provides RX/TX audio queues. Optional (requires pyVoIP). |
+
+### SIP Integration
+
+The server can dial into SIP calls and act as a conversation partner (full-duplex). SIP stages require `pyVoIP` (`pip install pyVoIP`).
 
 ```
-Eingehend (hoeren):
+Incoming (listen):
   SIPSource ──► SampleRateConverter(8k→16k) ──► WhisperTranscriber ──► Text
 
-Ausgehend (sprechen):
-  Text ──► TTSProducer ──► SampleRateConverter(24k→8k) ──► SIPSink
+Outgoing (speak):
+  Text ──► StreamingTTSProducer ──► SampleRateConverter(native→8k) ──► EncodingConverter(s16le→u8) ──► SIPSink
 
-Vollduplex-Call:
-  ┌─ SIPSource ──► SampleRateConverter ──► WhisperTranscriber ──► [LLM/Logic] ─┐
-  │                                                                             │
-  └─ SIPSink   ◄── SampleRateConverter ◄── TTSProducer ◄───────────────────────┘
+Full-duplex call (via /ws/pipe with two pipes):
+  ┌─ SIPSource ──► SampleRateConverter ──► WhisperTranscriber ──► ws:ndjson ─┐
+  │                                                                           │
+  └─ SIPSink   ◄── SampleRateConverter ◄── StreamingTTSProducer ◄── ws:text ─┘
 ```
 
-Geplante SIP-Stages:
-- **`SIPSource`** -- RTP-Empfang aus SIP-Call, liefert PCM-Stream (typisch 8kHz G.711 oder 16kHz). Registrierung als SIP-User-Agent via PJSIP oder baresip.
-- **`SIPSink`** -- PCM-Stream als RTP in den SIP-Call senden. Encoding in G.711/Opus.
-- **`SIPSession`** -- Orchestriert Source+Sink fuer einen Call: Dial, Hangup, DTMF, Hold/Resume. Verwaltet SIP-Registrierung und Call-State.
-- **`AudioMixer`** -- Mischt mehrere PCM-Streams fuer Konferenz-Szenarien.
+SIP stages:
+- **`SIPSession`** (`lib/SIPSession.py`) -- pyVoIP lifecycle: SIP registration, call setup, RX/TX audio queues. Managed by PipelineBuilder.
+- **`SIPSource`** (`lib/SIPSource.py`) -- Source stage: reads PCM s16le mono @ 8kHz from SIP call via rx_queue.
+- **`SIPSink`** (`lib/SIPSink.py`) -- Sink stage: writes PCM into SIP call via tx_queue. Hangs up when the pipeline ends.
 
-### Geplant: Weitere Stages
+### Planned Stages
 
-- **`NoiseGate`** -- Filtert Stille und Hintergrundrauschen vor der Transkription, reduziert Whisper-Last.
-- **`VADSplitter`** -- Voice Activity Detection als Stage: splittet den Stream in Sprach-Segmente, leitet nur aktive Teile weiter.
-- **`LLMBridge`** -- Nimmt transkribierten Text, sendet ihn an ein LLM (lokal oder API), gibt Antwort-Text an TTSProducer weiter. Ermoeglicht autonome Gespraeche.
+- **`NoiseGate`** -- Filters silence and background noise before transcription, reduces Whisper load.
+- **`VADSplitter`** -- Voice Activity Detection as a stage: splits the stream into speech segments, forwards only active parts.
+- **`LLMBridge`** -- Takes transcribed text, sends it to an LLM (local or API), feeds the response text to TTSProducer. Enables autonomous conversations.
 
 ## Requirements
 
@@ -114,6 +128,7 @@ Geplante SIP-Stages:
 - ffmpeg with rubberband support (`sudo apt install ffmpeg`)
 - [Piper](https://github.com/rhasspy/piper) Python bindings (install from source)
 - [faster-whisper](https://github.com/SYSTRAN/faster-whisper) (optional, for STT)
+- [pyVoIP](https://pypi.org/project/pyVoIP/) (optional, for SIP)
 
 ## Installation
 
@@ -208,7 +223,7 @@ Parameters:
 Streaming speech-to-text on a single HTTP connection. Raw PCM audio goes in via the request body, recognized text comes back as NDJSON.
 
 Headers:
-- `X-Sample-Rate` - Input sample rate in Hz (default: `16000`). If not 16000, a `SampleRateConverter` stage automatically resamples via ffmpeg.
+- `X-Sample-Rate` - Input sample rate in Hz (default: `16000`). If not 16000, a `SampleRateConverter` stage automatically resamples.
 
 Pipeline: `PCMInputReader(request.stream) -> [SampleRateConverter] -> WhisperTranscriber -> NDJSON`
 
@@ -266,7 +281,7 @@ my_llm_command | curl -T - -H 'Content-Type: text/plain' \
   -o out.wav 'http://localhost:5000/tts/stream?voice=de_DE-thorsten-medium'
 
 # Multiple sentences, streamed line by line
-printf "Erster Satz.\nZweiter Satz.\nDritter Satz.\n" | \
+printf "First sentence.\nSecond sentence.\nThird sentence.\n" | \
   curl -T - -H 'Content-Type: text/plain' \
   -o out.wav 'http://localhost:5000/tts/stream'
 
@@ -298,7 +313,7 @@ Query parameters: `?voice=de_DE-thorsten-medium` (optional)
 
 Protocol:
 1. Client connects to `ws://host:port/ws/tts?voice=...`
-2. Server sends a JSON text message: `{"sample_rate": 24000}`
+2. Server sends a JSON text message: `{"sample_rate": 22050}` (actual voice sample rate)
 3. Client sends text frames (one sentence per message)
 4. Server sends binary frames (PCM s16le mono at the declared sample rate)
 5. Client sends `__END__` text message when done
@@ -306,11 +321,111 @@ Protocol:
 
 Pipeline: `WebSocketReader.text_lines() -> StreamingTTSProducer -> WebSocketWriter`
 
+### `WS /ws/pipe`
+Generic pipeline endpoint. Instead of hardcoded STT/TTS WebSocket endpoints, `/ws/pipe` accepts a pipeline description as DSL and wires up the stages dynamically.
+
+Protocol:
+1. Client connects to `ws://host:port/ws/pipe`
+2. Client sends a JSON text message with the pipeline config
+3. Data flows according to the pipeline definition
+4. Server sends `__END__` when done (for ws sinks)
+
+#### Pipeline DSL
+
+Syntax: `element | element | ... | element`
+
+Each element: `type:param1:param2`
+
+| Type | Params | I/O | Stage |
+|------|--------|-----|-------|
+| `ws:pcm` | -- | PCM via WS binary | WebSocketReader / WebSocketWriter |
+| `ws:text` | -- | text via WS text | WebSocketReader.text_lines() / ws.send() |
+| `ws:ndjson` | -- | NDJSON via WS text | ws.send(line) |
+| `resample` | FROM:TO | PCM -> PCM | SampleRateConverter |
+| `stt` | LANG | PCM -> NDJSON | WhisperTranscriber |
+| `tts` | VOICE | text -> PCM | StreamingTTSProducer |
+| `sip` | TARGET | PCM via RTP | SIPSource / SIPSink |
+| `vc` | VOICE2 | PCM -> PCM | VCConverter |
+| `pitch` | ST | PCM -> PCM | PitchAdjuster |
+
+Type transitions (automatically inserted):
+- `stt -> tts`: NdjsonToText adapter extracts `.text` from NDJSON
+- `stt -> ws:ndjson`: NDJSON bytes sent as WS text frames
+- `stt -> ws:text`: NdjsonToText -> ws.send(text)
+- `ws:text -> tts`: text lines directly to StreamingTTSProducer
+
+#### Single pipe config
+
+```json
+{"pipe": "ws:pcm | resample:48000:16000 | stt:de | ws:ndjson"}
+```
+
+#### Multi pipe config (duplex)
+
+```json
+{"pipes": [
+  "sip:100@pbx | resample:8000:16000 | stt:de | ws:ndjson",
+  "ws:text | tts:de_DE-thorsten-medium | resample:22050:8000 | sip:100@pbx"
+]}
+```
+
+SIP sessions with the same target are shared across pipes (same call, bidirectional).
+
+#### Example pipes
+
+```
+STT:     ws:pcm | resample:48000:16000 | stt:de | ws:ndjson
+TTS:     ws:text | tts:de_DE-thorsten-medium | ws:pcm
+STS:     ws:pcm | resample:48000:16000 | stt:de | tts:de_DE-thorsten-medium | ws:pcm
+SIP-TX:  ws:text | tts:de_DE-thorsten-medium | resample:22050:8000 | sip:100@pbx
+SIP-RX:  sip:100@pbx | resample:8000:16000 | stt:de | ws:ndjson
+```
+
+#### SIP Stages
+
+| Stage | File | Description |
+|-------|------|-------------|
+| `SIPSession` | `lib/SIPSession.py` | pyVoIP lifecycle: SIP registration, call setup, MediaPort with RX/TX queues |
+| `SIPSource` | `lib/SIPSource.py` | Source stage: reads PCM from SIP call via rx_queue |
+| `SIPSink` | `lib/SIPSink.py` | Sink stage: writes PCM into SIP call via tx_queue |
+
+SIP stages require `pyVoIP` (`pip install pyVoIP`). All other stages work without it.
+
+## SIP Bridge CLI
+
+`sip_bridge.py` is a standalone CLI tool that registers as a SIP client and dials into an Asterisk conference. It runs two pipelines in full-duplex:
+
+- **RX** (listen): SIPSource → SampleRateConverter(8k→16k) → WhisperTranscriber → CLIWriter (NDJSON on stdout)
+- **TX** (speak): CLIReader (stdin) → StreamingTTSProducer → SampleRateConverter(native→8k) → EncodingConverter(s16le→u8) → SIPSink
+
+Format conversion (encoding, sample rate) is handled automatically by `pipe()`.
+
+```bash
+# Setup Asterisk (once):
+sudo bash asterisk/setup.sh
+
+# Run the bridge:
+python3 sip_bridge.py --voice de_DE-thorsten-medium --lang de
+
+# Options:
+python3 sip_bridge.py \
+  --sip-server 127.0.0.1 --sip-port 5060 \
+  --sip-user piper --sip-password piper123 \
+  --extension 800 \
+  --voice de_DE-thorsten-medium \
+  --language de \
+  --whisper-model base \
+  --cuda --debug
+```
+
+Call extension 800 with a softphone to join the conference. Type text + Enter to speak into the conference. Transcriptions appear as NDJSON on stdout.
+
 ### Apache Proxy
 
 WebSocket endpoints require `mod_proxy_wstunnel`. Add WS rules **before** the HTTP rule:
 
 ```apache
+ProxyPass /tts/ws/pipe ws://localhost:5000/ws/pipe
 ProxyPass /tts/ws/stt ws://localhost:5000/ws/stt
 ProxyPass /tts/ws/tts ws://localhost:5000/ws/tts
 ProxyPass /tts http://localhost:5000
@@ -338,8 +453,8 @@ fetch('/tts/stream?voice=de_DE-thorsten-medium', {
 });
 
 // Push text as it becomes available:
-controller.enqueue(new TextEncoder().encode("Erster Satz.\n"));
-controller.enqueue(new TextEncoder().encode("Zweiter Satz.\n"));
+controller.enqueue(new TextEncoder().encode("First sentence.\n"));
+controller.enqueue(new TextEncoder().encode("Second sentence.\n"));
 
 // Signal end of input:
 controller.close();
@@ -347,12 +462,12 @@ controller.close();
 
 ## Browser Demos
 
-| Demo | Datei | Beschreibung |
-|------|-------|-------------|
-| STT | `examples/stt.html` | Mikrofon → WebSocket STT → Transkript-Anzeige |
-| STS | `examples/sts.html` | Mikrofon → STT → TTS → Lautsprecher (Roboterstimme) |
+| Demo | File | Description |
+|------|------|-------------|
+| STT | `examples/stt.html` | Microphone → WebSocket STT → transcript display |
+| STS | `examples/sts.html` | Microphone → STT → TTS → speaker (robot voice) |
 
-Oeffnen via `https://server/tts/examples/stt.html?api=https://server/tts`
+Open via `https://server/tts/examples/stt.html?api=https://server/tts`
 
 ## License
 

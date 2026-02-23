@@ -6,7 +6,7 @@ import os
 import threading
 from typing import Iterator, List, Optional
 
-from .base import Stage
+from .base import AudioFormat, Stage
 
 _LOGGER = logging.getLogger("whisper-stt")
 
@@ -78,6 +78,8 @@ class WhisperTranscriber(Stage):
         self.chunk_seconds = chunk_seconds
         self.sample_rate = sample_rate
         self.language = language
+        self.input_format = AudioFormat(sample_rate, "s16le")
+        self.output_format = AudioFormat(0, "ndjson")
 
     def stream_pcm24k(self) -> Iterator[bytes]:
         """Yields NDJSON lines (as bytes) instead of PCM.
@@ -102,7 +104,7 @@ class WhisperTranscriber(Stage):
             while len(buf) >= chunk_bytes:
                 segment_audio = buf[:chunk_bytes]
                 buf = buf[chunk_bytes:]
-                _LOGGER.info("transcribing chunk at offset=%.1fs (%d bytes)", time_offset, len(segment_audio))
+                _LOGGER.debug("transcribing chunk at offset=%.1fs (%d bytes)", time_offset, len(segment_audio))
                 for line in self._transcribe_chunk(model, segment_audio, time_offset):
                     _LOGGER.info("result: %s", line.decode().strip())
                     yield line
