@@ -886,50 +886,74 @@ def create_app(args: argparse.Namespace) -> Flask:
     # ---- WebSocket STT streaming endpoint ----
     @sock.route("/ws/stt")
     def ws_stt(ws):
-        """WebSocket STT: client sends PCM audio, server replies with NDJSON text.
+        """WebSocket STT: client sends codec audio, server replies with NDJSON text.
 
         Protocol:
-        - Client → Server: text '{"sampleRate": 48000}' first, then binary PCM s16le mono
-        - Server → Client: text NDJSON lines, text "__END__" when done
+        - Client → Server: hello handshake, then binary codec frames
+        - Server → Client: hello response, then text NDJSON lines, "__END__" when done
         """
-        from lib import WebSocketReader, SampleRateConverter
+        from lib import SampleRateConverter
         from lib.WhisperSTT import WhisperTranscriber
+        from lib import fourier_codec as codec
         import json as _json
 
         model_size = getattr(args, 'whisper_model', 'base')
 
-        # Read initial config message (must be JSON with sampleRate)
+        # Codec handshake
         try:
-            config_msg = ws.receive(timeout=10)
+            msg = ws.receive(timeout=10)
         except Exception:
-            ws.send(_json.dumps({"error": "No config message received"}))
-            return
+            msg = None
 
-        src_rate = 16000
-        chunk_seconds = 2.0
+        profile = "low"
         language = None
-        if isinstance(config_msg, str):
+        if isinstance(msg, str):
             try:
-                config = _json.loads(config_msg)
-                src_rate = int(config.get("sampleRate", 16000))
-                chunk_seconds = max(0.5, min(10.0, float(config.get("chunkSeconds", chunk_seconds))))
-                lang = config.get("language")
-                if lang and isinstance(lang, str) and len(lang) <= 5:
-                    language = lang.strip()
+                obj = _json.loads(msg)
+                if obj.get("type") == "hello":
+                    client_profiles = [p for p in obj.get("profiles", []) if p in codec.PROFILES]
+                    if client_profiles:
+                        profile = client_profiles[0]
+                    lang = obj.get("language")
+                    if lang and isinstance(lang, str) and len(lang) <= 5:
+                        language = lang.strip()
             except Exception:
                 pass
 
-        reader = WebSocketReader(ws)
-        pipeline = reader
-        if src_rate != 16000:
-            pipeline = pipeline.pipe(SampleRateConverter(src_rate, 16000))
-        pipeline = pipeline.pipe(WhisperTranscriber(model_size, chunk_seconds=chunk_seconds, language=language))
+        ws.send(_json.dumps({"type": "hello", "profile": profile}))
+
+        # Inline source: decode codec frames from WS into PCM
+        class _CodecWsSource:
+            def __init__(self):
+                self.cancelled = False
+            def stream_pcm24k(self):
+                while not self.cancelled:
+                    try:
+                        msg = ws.receive(timeout=60)
+                    except Exception:
+                        break
+                    if msg is None:
+                        break
+                    if isinstance(msg, str):
+                        if msg.strip() == "__END__":
+                            break
+                        continue
+                    try:
+                        samples, _prof = codec.decode_frame(msg)
+                        yield codec.float32_to_pcm_s16le(samples)
+                    except Exception as e:
+                        _LOGGER.debug("ws_stt decode error: %s", e)
+
+        src = _CodecWsSource()
+        stt = WhisperTranscriber(model_size, chunk_seconds=2.0, language=language)
+        pipeline = SampleRateConverter(48000, 16000)
+        pipeline.set_upstream(src)
+        stt.set_upstream(pipeline)
 
         try:
-            for chunk in pipeline.stream_pcm24k():
-                if reader.cancelled:
+            for chunk in stt.stream_pcm24k():
+                if src.cancelled:
                     break
-                # WhisperTranscriber yields NDJSON bytes (one line per segment)
                 for line in chunk.decode('utf-8', errors='replace').splitlines():
                     line = line.strip()
                     if line:
@@ -945,15 +969,15 @@ def create_app(args: argparse.Namespace) -> Flask:
     # ---- WebSocket TTS streaming endpoint ----
     @sock.route("/ws/tts")
     def ws_tts(ws):
-        """WebSocket TTS: client sends text lines, server replies with PCM audio.
+        """WebSocket TTS: client sends text, server replies with codec audio.
 
         Protocol:
-        - Client → Server: text messages (sentences), "__END__" to signal done
-        - Server → Client: text '{"sample_rate":24000}' once, then binary PCM
-          s16le mono chunks, text "__END__" when done.
+        - Client → Server: hello handshake, then text messages, "__END__" to signal done
+        - Server → Client: hello response, then binary codec frames, "__END__" when done
         - Voice via query param: ?voice=de_DE-thorsten-medium
         """
-        from lib import WebSocketReader, WebSocketWriter, StreamingTTSProducer
+        from lib import StreamingTTSProducer, SampleRateConverter
+        from lib import fourier_codec as codec
         import json as _json
 
         model_id = request.args.get("voice", default_model_id)
@@ -965,13 +989,70 @@ def create_app(args: argparse.Namespace) -> Flask:
         syn = registry.create_synthesis_config(voice, request.args.to_dict())
         sample_rate = voice.config.sample_rate
 
-        # Send config message
-        ws.send(_json.dumps({"sample_rate": sample_rate}))
+        # Codec handshake
+        try:
+            msg = ws.receive(timeout=10)
+        except Exception:
+            msg = None
 
-        reader = WebSocketReader(ws)
-        source = StreamingTTSProducer(reader.text_lines(), voice, syn)
-        writer = WebSocketWriter(ws, source, max_chunk_bytes=4800)
-        writer.run()
+        profile = "low"
+        if isinstance(msg, str):
+            try:
+                obj = _json.loads(msg)
+                if obj.get("type") == "hello":
+                    client_profiles = [p for p in obj.get("profiles", []) if p in codec.PROFILES]
+                    if client_profiles:
+                        profile = client_profiles[0]
+            except Exception:
+                pass
+
+        ws.send(_json.dumps({"type": "hello", "profile": profile}))
+
+        # Read text from WS, produce TTS, encode with codec, send back
+        def _text_lines():
+            while True:
+                try:
+                    msg = ws.receive(timeout=60)
+                except Exception:
+                    break
+                if msg is None:
+                    break
+                if isinstance(msg, bytes):
+                    continue
+                text = msg.strip()
+                if text == "__END__":
+                    break
+                if text:
+                    yield text
+
+        source = StreamingTTSProducer(_text_lines(), voice, syn)
+        pipeline = source
+        if sample_rate != 48000:
+            pipeline = pipeline.pipe(SampleRateConverter(sample_rate, 48000))
+
+        frame_bytes = codec.FRAME_SAMPLES * 2  # s16le
+        buf = b""
+        try:
+            for pcm in pipeline.stream_pcm24k():
+                buf += pcm
+                while len(buf) >= frame_bytes:
+                    chunk = buf[:frame_bytes]
+                    buf = buf[frame_bytes:]
+                    samples = codec.pcm_s16le_to_float32(chunk)
+                    encoded = codec.encode_frame(samples, profile)
+                    ws.send(encoded)
+            if buf:
+                padded = buf + b"\x00" * (frame_bytes - len(buf))
+                samples = codec.pcm_s16le_to_float32(padded)
+                encoded = codec.encode_frame(samples, profile)
+                ws.send(encoded)
+        except Exception as e:
+            _LOGGER.warning("ws_tts error: %s", e)
+        finally:
+            try:
+                ws.send("__END__")
+            except Exception:
+                pass
 
     # ---- Generic pipeline endpoint ----
     @sock.route("/ws/pipe")
