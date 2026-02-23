@@ -78,7 +78,7 @@ WS   /ws/pipe       Generic:        DSL-defined pipeline (e.g. ws:pcm | resample
 |-------|------|--------|-------------|
 | `ResponseWriter` | `lib/ResponseWriter.py` | done | Streams PCM as WAV HTTP response with correct headers and Content-Length estimation. Derives sample rate from upstream. |
 | `RawResponseWriter` | `lib/RawResponseWriter.py` | done | Raw file passthrough (no resampling, no WAV header). |
-| `WhisperTranscriber` | `lib/WhisperSTT.py` | done | Consumes PCM stream, transcribes in 3-second chunks via faster-whisper, outputs NDJSON segments (`{text, start, end}`). Lazy model loading, CPU/CUDA auto-detect with fallback. |
+| `WhisperTranscriber` | `lib/WhisperSTT.py` | done | Consumes PCM stream, transcribes via faster-whisper with pause-based chunking (silence detection), outputs NDJSON segments (`{text, start, end}`). Default model: `small`. Lazy model loading, CPU/CUDA auto-detect with fallback. |
 | `WebSocketWriter` | `lib/WebSocketWriter.py` | done | Reads PCM from upstream, sends as binary WebSocket messages (chunked). Sends `__END__` on completion. |
 | `SIPSink` | `lib/SIPSink.py` | done | Writes PCM audio as RTP packets into a SIP call via pyVoIP. Counterpart to SIPSource. |
 | `CLIWriter` | `lib/CLIWriter.py` | done | Writes NDJSON lines or text to stdout. For CLI tools (e.g. `sip_bridge.py`). |
@@ -322,7 +322,7 @@ ffmpeg -i test.wav -f s16le -ac 1 -ar 16000 - | \
 
 Note: Use `curl -T -` (not `--data-binary @-`) to stream stdin in real time. `--data-binary` buffers the entire input before sending.
 
-Use `--whisper-model` to select the model size (default: `base`). Available: `tiny`, `base`, `small`, `medium`, `large-v3`.
+Use `--whisper-model` to select the model size (default: `small`). Available: `tiny`, `base`, `small`, `medium`, `large-v3`. Can also be set per-pipeline via the DSL: `stt:de:3.0:medium`.
 
 ### `POST /tts/stream`
 Streaming TTS on a single HTTP connection. Text goes in via the request body, audio comes back as a streaming WAV response. The connection stays open — each line of text is synthesized and streamed as audio as soon as it arrives.
@@ -410,7 +410,7 @@ Each element: `type:param1:param2`
 | `ws:text` | -- | text via WS text | WebSocketReader.text_lines() / ws.send() |
 | `ws:ndjson` | -- | NDJSON via WS text | ws.send(line) |
 | `resample` | FROM:TO | PCM -> PCM | SampleRateConverter |
-| `stt` | LANG | PCM -> NDJSON | WhisperTranscriber |
+| `stt` | LANG or LANG:CHUNK:MODEL | PCM -> NDJSON | WhisperTranscriber (model: tiny/base/small/medium/large-v3) |
 | `tts` | VOICE | text -> PCM | StreamingTTSProducer |
 | `sip` | TARGET | PCM via RTP | SIPSource / SIPSink |
 | `vc` | VOICE2 | PCM -> PCM | VCConverter |

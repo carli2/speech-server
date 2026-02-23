@@ -41,7 +41,7 @@ def _device_candidates(preferred):
     yield "cpu", "float32"
 
 
-def _get_model(model_size: str = "base"):
+def _get_model(model_size: str = "small"):
     """Return a process-wide singleton WhisperModel, lazily loaded."""
     global _singleton_model
     if _singleton_model is not None:
@@ -71,7 +71,7 @@ class WhisperTranscriber(Stage):
     and yields one JSON line per recognized segment.
     """
 
-    def __init__(self, model_size: str = "base", chunk_seconds: float = 3.0,
+    def __init__(self, model_size: str = "small", chunk_seconds: float = 3.0,
                  sample_rate: int = 16000, language: Optional[str] = None) -> None:
         super().__init__()
         self.model_size = model_size

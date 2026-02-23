@@ -814,7 +814,7 @@ def create_app(args: argparse.Namespace) -> Flask:
         from lib.WhisperSTT import WhisperTranscriber
 
         src_rate = int(request.headers.get('X-Sample-Rate', 16000))
-        model_size = getattr(args, 'whisper_model', 'base')
+        model_size = getattr(args, 'whisper_model', 'small')
 
         # Use raw WSGI input — Werkzeug returns empty BytesIO() for
         # chunked requests without Content-Length (browser streaming).
@@ -897,7 +897,7 @@ def create_app(args: argparse.Namespace) -> Flask:
         from lib import fourier_codec as codec
         import json as _json
 
-        model_size = getattr(args, 'whisper_model', 'base')
+        model_size = getattr(args, 'whisper_model', 'small')
 
         # Codec handshake
         try:

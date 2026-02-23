@@ -246,7 +246,7 @@ class PipelineBuilder:
                 from .WhisperSTT import WhisperTranscriber
                 lang = params[0] if params else None
                 chunk_seconds = float(params[1]) if len(params) > 1 else 3.0
-                model_size = getattr(self.args, "whisper_model", "base")
+                model_size = params[2] if len(params) > 2 else getattr(self.args, "whisper_model", "small")
                 stage = WhisperTranscriber(model_size, chunk_seconds=chunk_seconds, language=lang)
                 if current_stage:
                     current_stage.pipe(stage)
