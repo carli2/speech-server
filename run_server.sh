@@ -33,8 +33,8 @@ if [[ ! -f "$SCRIPT_DIR/venv/bin/activate" ]]; then
   source "$SCRIPT_DIR/venv/bin/activate"
   echo "Upgrading pip/setuptools/wheel" >&2
   pip install --upgrade pip setuptools wheel
-  echo "Installing requirements" >&2
-  pip install -r "$SCRIPT_DIR/requirements.txt"
+  echo "Installing speech-pipeline (editable) with server+tts+stt extras" >&2
+  pip install -e "$SCRIPT_DIR[server,tts,stt]"
   if [[ -d "/home/carli/sources/piper" ]]; then
     echo "Installing Piper from local sources" >&2
     pip install -e /home/carli/sources/piper

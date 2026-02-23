@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "speech-pipeline"
+version = "0.1.0"
+description = "Composable stage-based speech pipeline — TTS, STT, voice conversion, SIP bridging"
+requires-python = ">=3.10"
+dependencies = ["numpy"]
+
+[project.optional-dependencies]
+tts = ["onnxruntime>=1.16"]
+stt = ["faster-whisper>=1.0"]
+vc  = ["TTS>=0.22", "torch>=2.1"]
+sip = ["pyVoIP>=1.6"]
+server = ["Flask>=2.3", "flask-sock>=0.7"]
+all = ["speech-pipeline[tts,stt,vc,sip,server]"]
+
+[tool.setuptools.packages.find]
+include = ["speech_pipeline*"]
+
+[project.scripts]
+speech-pipeline = "speech_pipeline.cli:main"

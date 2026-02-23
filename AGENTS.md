@@ -2,7 +2,13 @@
 
 ## Pflicht: Stage-Interface zuerst lesen
 
-Bevor du irgendetwas implementierst, lies `lib/base.py`. Das ist die Basisklasse `Stage`, auf der die gesamte Architektur aufbaut. Verstehe die Methoden `stream_pcm24k()`, `pipe()`, `cancel()` und `set_upstream()` vollstaendig, bevor du Code schreibst.
+Bevor du irgendetwas implementierst, lies `speech_pipeline/base.py`. Das ist die Basisklasse `Stage`, auf der die gesamte Architektur aufbaut. Verstehe die Methoden `stream_pcm24k()`, `pipe()`, `cancel()` und `set_upstream()` vollstaendig, bevor du Code schreibst.
+
+## Package-Struktur
+
+Der gesamte Bibliothekscode liegt in `speech_pipeline/` (pip-Paketname: `speech-pipeline`, import: `speech_pipeline`). Das Verzeichnis `lib/` existiert nur als Kompatibilitaets-Shim, damit `piper_multi_server.py` und `sip_bridge.py` weiterhin `from lib.X import Y` verwenden koennen.
+
+**Neuen Code immer in `speech_pipeline/` anlegen, niemals in `lib/`.**
 
 ## Alle Audio- und Text-Operationen sind Stages
 
@@ -30,7 +36,7 @@ Jede Operation, die Audio erzeugt, transformiert, konsumiert oder Text aus Audio
 7. **PCM-Format**: s16le mono. Sample-Rate je nach Kontext (24kHz fuer TTS, 16kHz fuer Whisper). Bei Raten-Unterschieden `SampleRateConverter` einsetzen.
 8. **Byte-Alignment**: s16le = 2 Bytes pro Sample. Yielde niemals eine ungerade Byte-Anzahl.
 9. **Singleton-Modelle** (Whisper, FreeVC, Piper) werden auf Modul-Ebene lazy geladen, nicht in der Stage selbst.
-10. **Exportiere** jede neue Stage in `lib/__init__.py`.
+10. **Exportiere** jede neue Stage in `speech_pipeline/__init__.py`.
 
 ### Keine Sonderwege
 
