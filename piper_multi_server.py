@@ -134,6 +134,15 @@ def create_app(args: argparse.Namespace) -> Flask:
 
     app = Flask(__name__)
     sock = Sock(app)
+
+    # Pipeline control API (requires --admin-token)
+    admin_token = getattr(args, 'admin_token', None) or ''
+    if admin_token:
+        from speech_pipeline.pipeline_api import api as pipeline_api_bp, init as pipeline_api_init
+        pipeline_api_init(admin_token)
+        app.register_blueprint(pipeline_api_bp)
+        _LOGGER.info("Pipeline control API enabled at /api/ (bearer-authenticated)")
+
     # Ensure our module logger emits at desired level and propagates to root handler
     try:
         _LOGGER.setLevel(logging.DEBUG if args.debug else logging.INFO)
@@ -1082,14 +1091,24 @@ def create_app(args: argparse.Namespace) -> Flask:
             ws.send(_json.dumps({"error": "Invalid JSON config"}))
             return
 
-        builder = PipelineBuilder(ws, registry, args)
+        # Track in LivePipeline registry if admin API is enabled
+        from speech_pipeline.live_pipeline import LivePipeline, register as _lp_register, unregister as _lp_unregister
+        dsl = config.get("pipe", "") or "; ".join(config.get("pipes", []))
+        lp = LivePipeline(dsl=dsl)
+        builder = PipelineBuilder(ws, registry, args, live_pipeline=lp)
 
         try:
             if "pipe" in config:
                 run = builder.build(config["pipe"])
+                lp.run = run
+                lp.state = "running"
+                _lp_register(lp)
                 run.run()
             elif "pipes" in config:
                 runs = builder.build_multi(config["pipes"])
+                lp.run = runs[0] if runs else None
+                lp.state = "running"
+                _lp_register(lp)
                 if len(runs) == 1:
                     runs[0].run()
                 else:
@@ -1106,6 +1125,9 @@ def create_app(args: argparse.Namespace) -> Flask:
                 ws.send(_json.dumps({"error": str(e)}))
             except Exception:
                 pass
+        finally:
+            lp.state = "stopped"
+            _lp_unregister(lp.id)
 
     # ---- Codec WebSocket endpoint ----
     @sock.route("/ws/socket/<session_id>")
@@ -1179,6 +1201,7 @@ def main() -> None:
     parser.add_argument("--soundpath", default="../voices/%s.wav", help="Template for sound/voice2 source. Use %s placeholder for id. Supports file paths or http(s) URLs.")
     parser.add_argument("--bearer", default="", help="Bearer token for authorizing remote (http/https) downloads/streams")
     parser.add_argument("--whisper-model", default="base", help="Whisper model size for STT (default: base)")
+    parser.add_argument("--admin-token", default="", help="Bearer token to enable the /api/ pipeline control endpoints")
     parser.add_argument("--debug", action="store_true")
     args = parser.parse_args()
 

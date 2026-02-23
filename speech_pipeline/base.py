@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from typing import Iterator, List, Optional
+from uuid import uuid4
 
 _LOGGER = logging.getLogger("stage")
 
@@ -70,6 +71,7 @@ class Stage:
     output_format: Optional[AudioFormat] = None
 
     def __init__(self) -> None:
+        self.id: str = uuid4().hex[:8]
         self.upstream: Optional[Stage] = None
         self.downstream: Optional[Stage] = None
         self.cancelled: bool = False

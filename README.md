@@ -229,6 +229,9 @@ speech-pipeline run "cli:text | tts:de_DE-thorsten-medium | cli:raw"
 # Start the HTTP/WebSocket server
 speech-pipeline serve --host 0.0.0.0 --port 5000 --voices-path voices-piper
 
+# Start with pipeline control API enabled
+speech-pipeline serve --admin-token SECRET --voices-path voices-piper
+
 # Start the SIP conference bridge
 speech-pipeline sip-bridge -- --voice de_DE-thorsten-medium --lang de
 
@@ -314,6 +317,47 @@ Generic pipeline endpoint. Send JSON config (`{"pipe": "..."}` or `{"pipes": [..
 ### `WS /ws/socket/<id>`
 Fourier codec bidirectional audio socket with profile handshake.
 
+## Pipeline Control API
+
+All `/api/*` endpoints require `--admin-token` to be set on the server and `Authorization: Bearer <token>` on every request.
+
+```bash
+# Start server with admin API enabled
+speech-pipeline serve --admin-token SECRET
+```
+
+### `GET /api/pipelines`
+List all running pipelines (id, DSL, state, stage count).
+
+### `POST /api/pipelines`
+Create a pipeline from DSL. Body: `{"dsl": "cli:text | tts:voice | cli:raw"}`.
+
+### `GET /api/pipelines/<pid>`
+Pipeline detail with full stage list, audio formats, and edge graph.
+
+### `DELETE /api/pipelines/<pid>`
+Cancel and remove a pipeline.
+
+### `GET /api/pipelines/<pid>/stages`
+List stages in a pipeline (id, type, config, cancelled).
+
+### `GET /api/pipelines/<pid>/stages/<sid>`
+Single stage detail including input/output audio format.
+
+### `PATCH /api/pipelines/<pid>/stages/<sid>`
+Hot-update stage config without restart. Supported: `GainStage` (gain), `DelayLine` (delay_ms).
+
+```bash
+curl -X PATCH -H "Authorization: Bearer SECRET" \
+  -d '{"gain": 0.5}' http://localhost:5000/api/pipelines/abc123/stages/def456
+```
+
+### `DELETE /api/pipelines/<pid>/stages/<sid>`
+Remove a processor stage and reconnect its neighbors.
+
+### `POST /api/pipelines/<pid>/stages/<sid>/replace`
+Replace a stage with a new one built from a DSL element. Body: `{"element": "gain:2.0"}`.
+
 ## Fourier Codec
 
 Custom FFT-based audio codec for compressed real-time audio over WebSockets.
@@ -339,6 +383,55 @@ TX: CLIReader --> StreamingTTSProducer --> SampleRateConverter(native->8k) --> S
 ```
 
 SIP stages require `pyVoIP` (`pip install pyVoIP`).
+
+## Cluster Architecture
+
+For high-throughput deployments, speech-pipeline supports horizontal scaling across multiple nodes.
+
+### Overview
+
+```
+Clients ──► Entry Nodes (pipeline orchestration)
+                │
+                ├──► GPU Worker A (TTS/STT stages)
+                ├──► GPU Worker B (TTS/STT stages)
+                └──► GPU Worker C (voice conversion)
+```
+
+**Entry nodes** accept WebSocket connections and instantiate the full pipeline. When an entry node is at capacity, it discovers free worker nodes in the cluster and offloads compute-intensive stages (TTS, STT, voice conversion) to them. The offloaded stages communicate back through WebSocket channels with Fourier codec compression -- the same codec transport already used for client connections.
+
+**Client-side load balancing**: DNS returns shuffled IPs for entry nodes. Each client connects to a random entry node, distributing connections without a central load balancer.
+
+### How It Works
+
+1. Client connects to an entry node via `WS /ws/pipe` with a DSL config
+2. Entry node builds the full pipeline locally
+3. If the entry node is under heavy load, it uses the pipeline control API (`/api/`) to:
+   - Locate a worker node with free capacity
+   - Deploy the heavy stages (e.g. `stt`, `tts`, `vc`) on the worker via `POST /api/pipelines`
+   - Replace the local stages with `codec` bridge stages that route audio to/from the worker
+4. From the client's perspective, nothing changes -- the pipeline still streams as before
+
+### Stage Offloading
+
+Any processor stage can be offloaded by replacing it with a codec bridge pair:
+
+```
+Before:  ws:pcm | stt:de | ws:ndjson        (all local)
+After:   ws:pcm | codec:worker1 | ws:ndjson  (STT runs on worker1)
+```
+
+The Fourier codec adds minimal latency. At `low` profile, the FFT computation is ~6 microseconds per frame; the bottleneck is Python bit-packing at ~700 microseconds, supporting ~30 concurrent streams per CPU core. Use `medium` or `high` profiles for better audio quality at higher bandwidth.
+
+### Performance Notes
+
+| Profile | Concurrent streams/core | Bandwidth/stream | Quality |
+|---------|------------------------|-------------------|---------|
+| `low` | ~30 | ~12 KB/s | Telephone |
+| `medium` | ~15 | ~32 KB/s | Good speech |
+| `high` | ~8 | ~72 KB/s | Near-CD |
+
+GPU-bound stages (TTS, STT, VC) scale with GPU count. CPU-bound codec transport scales linearly with cores.
 
 ## Voice Models
 

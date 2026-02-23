@@ -67,10 +67,11 @@ class PipelineBuilder:
         codec       CodecSocketSource/Sink (codec:ID or codec:ID:PROFILE)
     """
 
-    def __init__(self, ws, registry, args) -> None:
+    def __init__(self, ws, registry, args, live_pipeline=None) -> None:
         self.ws = ws
         self.registry = registry
         self.args = args
+        self.live_pipeline = live_pipeline
         self._sip_sessions: Dict[str, Any] = {}
         self._mixers: Dict[str, Any] = {}  # name -> AudioMixer
         self._codec_sessions: Dict[str, Any] = {}  # id -> CodecSocketSession
@@ -540,7 +541,24 @@ class PipelineBuilder:
                 return drain
             run._run_fn = make_drain(stage)
 
+        # Populate LivePipeline if provided
+        if self.live_pipeline is not None:
+            self._populate_live_pipeline(run, elements)
+
         return run
+
+    def _populate_live_pipeline(self, run: PipelineRun, elements: List[Tuple[str, List[str]]]) -> None:
+        """Register all stages and edges from a built PipelineRun in the LivePipeline."""
+        lp = self.live_pipeline
+        # Map element types to stages by position
+        elem_types = {i: f"{t}:{':'.join(p)}" if p else t for i, (t, p) in enumerate(elements)}
+        for i, stage in enumerate(run.stages):
+            typ = elem_types.get(i, "unknown")
+            lp.add_stage(stage, typ)
+        # Build edges from upstream/downstream links
+        for stage in run.stages:
+            if stage.upstream and stage.upstream.id in lp.stages:
+                lp.add_edge(stage.upstream.id, stage.id)
 
     def build_multi(self, pipes: List[str]) -> List[PipelineRun]:
         """Build multiple pipelines. SIP sessions with the same target are shared."""

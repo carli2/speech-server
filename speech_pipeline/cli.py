@@ -52,6 +52,7 @@ def cmd_serve(args: argparse.Namespace) -> None:
         soundpath=getattr(args, "soundpath", "../voices/%s.wav"),
         bearer=getattr(args, "bearer", ""),
         whisper_model=getattr(args, "whisper_model", "small"),
+        admin_token=getattr(args, "admin_token", ""),
         debug=args.debug,
         voice_ttl_seconds=7200,
         voice_cache_max=64,
@@ -120,6 +121,7 @@ def main() -> None:
     p_serve.add_argument("--whisper-model", default="small")
     p_serve.add_argument("--soundpath", default="../voices/%s.wav")
     p_serve.add_argument("--bearer", default="")
+    p_serve.add_argument("--admin-token", default="", help="Bearer token to enable /api/ pipeline control")
 
     # --- sip-bridge ---
     p_sip = sub.add_parser("sip-bridge", help="SIP conference bridge with STT/TTS")
