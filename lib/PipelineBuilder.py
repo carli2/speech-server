@@ -59,6 +59,9 @@ class PipelineBuilder:
         sip         SIPSource/SIPSink    (sip:TARGET)
         vc          VCConverter          (vc:VOICE2)
         pitch       PitchAdjuster        (pitch:ST)
+        record      FileRecorder sidechain (record:FILE or record:FILE:RATE)
+        tee         AudioTee feeding a named mixer (tee:NAME)
+        mix         AudioMixer source (mix:NAME or mix:NAME:RATE)
     """
 
     def __init__(self, ws, registry, args) -> None:
@@ -66,6 +69,7 @@ class PipelineBuilder:
         self.registry = registry
         self.args = args
         self._sip_sessions: Dict[str, Any] = {}
+        self._mixers: Dict[str, Any] = {}  # name -> AudioMixer
 
     def parse(self, pipe_str: str) -> List[Tuple[str, List[str]]]:
         """Parse ``'a:x:y | b:z | c'`` into ``[('a', ['x','y']), ('b', ['z']), ('c', [])]``."""
@@ -330,6 +334,131 @@ class PipelineBuilder:
                 run.stages.append(stage)
                 current_output_type = "pcm"
 
+            elif typ == "record":
+                # record:FILE or record:FILE:RATE
+                # Middle element: wraps in AudioTee, adds FileRecorder sidechain.
+                if not params:
+                    raise ValueError("record requires a filename (e.g. record:output.mp3)")
+                filename = params[0]
+                rate = int(params[1]) if len(params) > 1 else None
+
+                if not current_stage or current_output_type != "pcm":
+                    raise ValueError("record requires PCM upstream")
+
+                # Derive rate from upstream if not specified
+                if rate is None:
+                    if current_stage.output_format and current_stage.output_format.sample_rate > 0:
+                        rate = current_stage.output_format.sample_rate
+                    else:
+                        rate = 16000
+
+                encoding = "s16le"
+                if current_stage.output_format:
+                    encoding = current_stage.output_format.encoding
+
+                from .AudioTee import AudioTee
+                from .FileRecorder import FileRecorder
+
+                tee = AudioTee(rate, encoding)
+                if current_stage:
+                    current_stage.pipe(tee)
+                run.stages.append(tee)
+
+                recorder = FileRecorder(filename, rate)
+                tee.add_sidechain(recorder)
+                run.stages.append(recorder)
+
+                current_stage = tee
+                current_output_type = "pcm"
+
+            elif typ == "tee":
+                # tee:NAME — feeds a named mixer.
+                if not params:
+                    raise ValueError("tee requires a mixer name (e.g. tee:call)")
+                mixer_name = params[0]
+
+                if not current_stage or current_output_type != "pcm":
+                    raise ValueError("tee requires PCM upstream")
+
+                rate = 0
+                encoding = "s16le"
+                if current_stage.output_format:
+                    rate = current_stage.output_format.sample_rate
+                    encoding = current_stage.output_format.encoding
+
+                from .AudioTee import AudioTee
+
+                tee = AudioTee(rate, encoding)
+                if current_stage:
+                    current_stage.pipe(tee)
+                run.stages.append(tee)
+
+                # Get or create the mixer, then register an input queue
+                mixer = self._get_or_create_mixer(mixer_name)
+                mixer_input_q = mixer.add_input()
+
+                # If tee rate differs from mixer rate, we need a resampler
+                # between the tee and the mixer queue. For simplicity, the
+                # tee feeds the mixer queue directly at its own rate; the
+                # mixer's rate is set by the first tee or by mix:NAME:RATE.
+                # If rates differ, insert a SampleRateConverter in a thread.
+                if rate > 0 and mixer.sample_rate > 0 and rate != mixer.sample_rate:
+                    from .SampleRateConverter import SampleRateConverter
+                    from .QueueSource import QueueSource
+                    import queue as _queue
+
+                    # tee -> intermediate queue -> SRC -> mixer queue
+                    intermediate_q = _queue.Queue(maxsize=200)
+                    tee.add_mixer_feed(intermediate_q)
+
+                    src = QueueSource(intermediate_q, rate, encoding)
+                    src_stage = SampleRateConverter(rate, mixer.sample_rate)
+                    src.pipe(src_stage)
+                    run.stages.append(src_stage)
+
+                    def _make_resampler_thread(src_stage, mixer_q):
+                        def _resample():
+                            try:
+                                for chunk in src_stage.stream_pcm24k():
+                                    try:
+                                        mixer_q.put_nowait(chunk)
+                                    except Exception:
+                                        pass
+                            except Exception as e:
+                                _LOGGER.warning("tee resampler error: %s", e)
+                            finally:
+                                try:
+                                    mixer_q.put(None, timeout=1.0)
+                                except Exception:
+                                    pass
+                        return _resample
+
+                    t = threading.Thread(
+                        target=_make_resampler_thread(src_stage, mixer_input_q),
+                        daemon=True,
+                    )
+                    t.start()
+                    run._cancel_extras.append(lambda s=src_stage: s.cancel())
+                else:
+                    tee.add_mixer_feed(mixer_input_q)
+
+                current_stage = tee
+                current_output_type = "pcm"
+
+            elif typ == "mix":
+                # mix:NAME or mix:NAME:RATE — AudioMixer source.
+                if not params:
+                    raise ValueError("mix requires a mixer name (e.g. mix:call)")
+                if not is_first:
+                    raise ValueError("mix element must be at the start of a pipeline")
+                mixer_name = params[0]
+                rate = int(params[1]) if len(params) > 1 else 16000
+
+                mixer = self._get_or_create_mixer(mixer_name, rate)
+                current_stage = mixer
+                run.stages.append(mixer)
+                current_output_type = "pcm"
+
             else:
                 raise ValueError(f"Unknown pipeline element: {typ}")
 
@@ -349,6 +478,14 @@ class PipelineBuilder:
     def build_multi(self, pipes: List[str]) -> List[PipelineRun]:
         """Build multiple pipelines. SIP sessions with the same target are shared."""
         return [self.build(p) for p in pipes]
+
+    def _get_or_create_mixer(self, name: str, sample_rate: int = 16000):
+        if name in self._mixers:
+            return self._mixers[name]
+        from .AudioMixer import AudioMixer
+        mixer = AudioMixer(name, sample_rate)
+        self._mixers[name] = mixer
+        return mixer
 
     def _get_or_create_sip_session(self, target: str):
         if target in self._sip_sessions:

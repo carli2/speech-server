@@ -53,6 +53,8 @@ WS   /ws/pipe       Generic:        DSL-defined pipeline (e.g. ws:pcm | resample
 | `WebSocketReader` | `lib/WebSocketReader.py` | done | Reads binary or text messages from a flask-sock WebSocket. `stream_pcm24k()` for PCM bytes (STT), `text_lines()` for text (TTS). |
 | `SIPSource` | `lib/SIPSource.py` | done | Receives RTP audio from a SIP call as PCM stream via pyVoIP. |
 | `CLIReader` | `lib/CLIReader.py` | done | Reads text lines from stdin. For CLI tools (e.g. `sip_bridge.py`). |
+| `QueueSource` | `lib/QueueSource.py` | done | Reads PCM from a `queue.Queue`. Bridge between AudioTee/AudioMixer and their consumers. `None` = EOF sentinel. |
+| `AudioMixer` | `lib/AudioMixer.py` | done | Mixes N input queues into one output using `audioop.add()` on fixed-size frames. Used as source for mixed recordings. |
 
 #### Processors (transform PCM, have upstream)
 
@@ -62,8 +64,8 @@ WS   /ws/pipe       Generic:        DSL-defined pipeline (e.g. ws:pcm | resample
 | `PitchAdjuster` | `lib/PitchAdjuster.py` | done | Pitch shifting via ffmpeg rubberband (formant-preserving). Auto-estimation from source/target F0 or explicit semitone override. |
 | `SampleRateConverter` | `lib/SampleRateConverter.py` | done | Resampling between arbitrary sample rates via audioop (zero-latency, no subprocess). No-op when rates match. |
 | `EncodingConverter` | `lib/EncodingConverter.py` | done | Converts between audio encodings (s16le ↔ u8). Auto-inserted by `pipe()`. |
+| `AudioTee` | `lib/AudioTee.py` | done | Pass-through that copies data to side-chain sinks via queues in background threads. Used for recording while streaming. |
 | `NoiseGate` | -- | **planned** | Removes silence/noise from the stream, reduces Whisper compute. |
-| `AudioMixer` | -- | **planned** | Mixes multiple PCM streams (e.g. for SIP conferences). |
 
 #### Sinks (consume PCM, produce output)
 
@@ -75,6 +77,7 @@ WS   /ws/pipe       Generic:        DSL-defined pipeline (e.g. ws:pcm | resample
 | `WebSocketWriter` | `lib/WebSocketWriter.py` | done | Reads PCM from upstream, sends as binary WebSocket messages (chunked). Sends `__END__` on completion. |
 | `SIPSink` | `lib/SIPSink.py` | done | Writes PCM audio as RTP packets into a SIP call via pyVoIP. Counterpart to SIPSource. |
 | `CLIWriter` | `lib/CLIWriter.py` | done | Writes NDJSON lines or text to stdout. For CLI tools (e.g. `sip_bridge.py`). |
+| `FileRecorder` | `lib/FileRecorder.py` | done | Records PCM to file (MP3/WAV/OGG/etc.) by streaming to ffmpeg stdin. No temp files. Terminal sink. |
 
 #### Adapters (not stages, but used by the pipeline)
 
@@ -347,6 +350,9 @@ Each element: `type:param1:param2`
 | `sip` | TARGET | PCM via RTP | SIPSource / SIPSink |
 | `vc` | VOICE2 | PCM -> PCM | VCConverter |
 | `pitch` | ST | PCM -> PCM | PitchAdjuster |
+| `record` | FILE or FILE:RATE | PCM -> PCM (pass-through) | AudioTee + FileRecorder sidechain |
+| `tee` | NAME | PCM -> PCM (pass-through) | AudioTee feeding named mixer |
+| `mix` | NAME or NAME:RATE | -- -> PCM (source only) | AudioMixer |
 
 Type transitions (automatically inserted):
 - `stt -> tts`: NdjsonToText adapter extracts `.text` from NDJSON
@@ -374,12 +380,34 @@ SIP sessions with the same target are shared across pipes (same call, bidirectio
 #### Example pipes
 
 ```
-STT:     ws:pcm | resample:48000:16000 | stt:de | ws:ndjson
-TTS:     ws:text | tts:de_DE-thorsten-medium | ws:pcm
-STS:     ws:pcm | resample:48000:16000 | stt:de | tts:de_DE-thorsten-medium | ws:pcm
-SIP-TX:  ws:text | tts:de_DE-thorsten-medium | resample:22050:8000 | sip:100@pbx
-SIP-RX:  sip:100@pbx | resample:8000:16000 | stt:de | ws:ndjson
+STT:      ws:pcm | resample:48000:16000 | stt:de | ws:ndjson
+TTS:      ws:text | tts:de_DE-thorsten-medium | ws:pcm
+STS:      ws:pcm | resample:48000:16000 | stt:de | tts:de_DE-thorsten-medium | ws:pcm
+SIP-TX:   ws:text | tts:de_DE-thorsten-medium | resample:22050:8000 | sip:100@pbx
+SIP-RX:   sip:100@pbx | resample:8000:16000 | stt:de | ws:ndjson
+TTS+REC:  ws:text | tts:de_DE-thorsten-medium | record:output.mp3:22050 | ws:pcm
 ```
+
+#### Recording and mixing
+
+`record` inserts an AudioTee that copies all audio to a FileRecorder sidechain. The main pipeline continues unchanged.
+
+```
+# Record SIP inbound to MP3 while transcribing:
+sip:100@pbx | record:incoming.mp3:8000 | resample:8000:16000 | stt:de | ws:ndjson
+```
+
+`tee` + `mix` enable mixed recordings of multiple streams (e.g. both sides of a SIP call):
+
+```json
+{"pipes": [
+  "sip:100@pbx | tee:call | resample:8000:16000 | stt:de | ws:ndjson",
+  "ws:text | tts:de_DE-thorsten-medium | resample:22050:8000 | tee:call | sip:100@pbx",
+  "mix:call:8000 | record:call.mp3"
+]}
+```
+
+Each `tee:call` feeds a queue into the `mix:call` mixer. The mixer combines all inputs using `audioop.add()` and the result is recorded to file. If tee and mixer sample rates differ, a SampleRateConverter is auto-inserted.
 
 #### SIP Stages
 

@@ -20,6 +20,10 @@ from .PipelineBuilder import PipelineBuilder
 from .AudioSocketSession import AudioSocketSession
 from .AudioSocketSource import AudioSocketSource
 from .AudioSocketSink import AudioSocketSink
+from .QueueSource import QueueSource
+from .FileRecorder import FileRecorder
+from .AudioTee import AudioTee
+from .AudioMixer import AudioMixer
 
 # Optional: SIP stages (require pyVoIP)
 try:
