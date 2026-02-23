@@ -84,31 +84,54 @@ class WhisperTranscriber(Stage):
     def stream_pcm24k(self) -> Iterator[bytes]:
         """Yields NDJSON lines (as bytes) instead of PCM.
 
-        Each line is a UTF-8 encoded JSON object: {"text": ..., "start": ..., "end": ...}
+        Accumulates audio and transcribes at natural pause boundaries
+        (silence detection) rather than fixed time intervals, so words
+        are never split mid-utterance.
         """
         import numpy as np
         model = _get_model(self.model_size)
-        chunk_bytes = int(self.sample_rate * 2 * self.chunk_seconds)  # s16le = 2 bytes/sample
 
         if not self.upstream:
             return
 
+        bps = self.sample_rate * 2  # bytes per second (s16le)
+        min_chunk_bytes = int(bps * 1.0)     # at least 1s before transcribing
+        max_chunk_bytes = int(bps * 15.0)    # safety net: transcribe after 15s
+        silence_trigger = int(bps * 0.3)     # 300ms silence = pause detected
+        rms_floor = 200                       # int16 RMS below this = silence
+
         buf = b""
         time_offset = 0.0
+        silence_run = 0
 
-        _LOGGER.info("WhisperTranscriber: waiting for upstream data (chunk_bytes=%d)", chunk_bytes)
+        _LOGGER.info("WhisperTranscriber: pause-based chunking (silence=300ms, min=1s, max=15s)")
         for pcm in self.upstream.stream_pcm24k():
             if self.cancelled:
                 break
+
+            # Track silence
+            samples = np.frombuffer(pcm, dtype=np.int16)
+            rms = int(np.sqrt(np.mean(samples.astype(np.float64) ** 2)))
+            if rms < rms_floor:
+                silence_run += len(pcm)
+            else:
+                silence_run = 0
+
             buf += pcm
-            while len(buf) >= chunk_bytes:
-                segment_audio = buf[:chunk_bytes]
-                buf = buf[chunk_bytes:]
-                _LOGGER.debug("transcribing chunk at offset=%.1fs (%d bytes)", time_offset, len(segment_audio))
-                for line in self._transcribe_chunk(model, segment_audio, time_offset):
+
+            # Transcribe when: enough audio AND pause detected, or buffer too long
+            should_flush = (len(buf) >= min_chunk_bytes and silence_run >= silence_trigger) \
+                        or len(buf) >= max_chunk_bytes
+            if should_flush:
+                chunk_dur = len(buf) / bps
+                _LOGGER.debug("transcribing %.1fs at offset=%.1fs (silence=%dms)",
+                              chunk_dur, time_offset, silence_run * 1000 // bps)
+                for line in self._transcribe_chunk(model, buf, time_offset):
                     _LOGGER.info("result: %s", line.decode().strip())
                     yield line
-                time_offset += self.chunk_seconds
+                time_offset += chunk_dur
+                buf = b""
+                silence_run = 0
 
         # Flush remaining
         if buf and not self.cancelled:
