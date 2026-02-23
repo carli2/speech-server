@@ -13,6 +13,8 @@
     width: 100%; padding: .5rem .8rem; border: 1px solid #2a3a5c; border-radius: 6px;
     background: #0f3460; color: #e0e0e0; font-size: .9rem; margin-bottom: 1rem;
   }
+  .row { display: flex; gap: .8rem; margin-bottom: 1rem; }
+  .row > * { flex: 1; }
   button {
     width: 100%; padding: .8rem; border: none; border-radius: 6px;
     font-size: 1rem; font-weight: 600; cursor: pointer; transition: background .2s;
@@ -42,8 +44,21 @@
   <label for="api-url">Server-URL</label>
   <input type="text" id="api-url" value="https://srv.launix.de/tts">
 
-  <label for="voice">Stimme</label>
-  <input type="text" id="voice" value="de_DE-thorsten-medium">
+  <div class="row">
+    <div>
+      <label for="voice">Stimme</label>
+      <input type="text" id="voice" value="de_DE-thorsten-medium">
+    </div>
+    <div>
+      <label for="profile">Codec-Profil</label>
+      <select id="profile">
+        <option value="low">low</option>
+        <option value="medium" selected>medium</option>
+        <option value="high">high</option>
+        <option value="full">full</option>
+      </select>
+    </div>
+  </div>
 
   <button id="btn-rec">Aufnahme starten</button>
   <div id="level-bar"><div id="level-fill"></div></div>
@@ -51,9 +66,12 @@
   <div id="status"></div>
 </div>
 
+<script src="codec.js"></script>
 <script>
+var Codec = AudioCodec;
 var apiInput   = document.getElementById('api-url');
 var voiceInput = document.getElementById('voice');
+var profileSel = document.getElementById('profile');
 var btn        = document.getElementById('btn-rec');
 var transcript = document.getElementById('transcript');
 var statusEl   = document.getElementById('status');
@@ -62,20 +80,18 @@ var levelFill  = document.getElementById('level-fill');
 var params = new URLSearchParams(location.search);
 if (params.get('api')) apiInput.value = params.get('api');
 if (params.get('voice')) voiceInput.value = params.get('voice');
+if (params.get('profile')) profileSel.value = params.get('profile');
 
 var recording = false;
-var mediaStream = null;
-var audioCtx = null;
-var analyser = null;
-var scriptNode = null;
-var levelRaf = null;
-var sttWs = null;
-var ttsWs = null;
+var pipeWs = null;
+var codecWs = null;
+var mic = null;
+var speaker = null;
+var sessionId = null;
 
-// -- TTS playback state --
-var ttsSampleRate = 24000;
-var playCtx = null;       // AudioContext for playback
-var nextPlayTime = 0;     // scheduled time for next chunk
+function uuid() {
+  return 'xxxx-xxxx'.replace(/x/g, function () { return (Math.random() * 16 | 0).toString(16); });
+}
 
 function fmtTime(s) {
   var m = Math.floor(s / 60);
@@ -101,180 +117,126 @@ function addSegment(seg, extra) {
   transcript.scrollTop = transcript.scrollHeight;
 }
 
-function updateLevel() {
-  if (!analyser) return;
-  var buf = new Uint8Array(analyser.fftSize);
-  analyser.getByteTimeDomainData(buf);
-  var sum = 0;
-  for (var i = 0; i < buf.length; i++) {
-    var v = (buf[i] - 128) / 128;
-    sum += v * v;
-  }
-  var rms = Math.sqrt(sum / buf.length);
-  levelFill.style.width = Math.min(100, rms * 400) + '%';
-  if (recording) levelRaf = requestAnimationFrame(updateLevel);
-}
-
-function playPcmChunk(pcmBuf) {
-  if (!playCtx) {
-    playCtx = new AudioContext({ sampleRate: ttsSampleRate });
-  }
-  var int16 = new Int16Array(pcmBuf);
-  var float32 = new Float32Array(int16.length);
-  for (var i = 0; i < int16.length; i++) {
-    float32[i] = int16[i] / 32768.0;
-  }
-  var audioBuf = playCtx.createBuffer(1, float32.length, ttsSampleRate);
-  audioBuf.getChannelData(0).set(float32);
-  var src = playCtx.createBufferSource();
-  src.buffer = audioBuf;
-  src.connect(playCtx.destination);
-  var now = playCtx.currentTime;
-  if (nextPlayTime < now) nextPlayTime = now;
-  src.start(nextPlayTime);
-  nextPlayTime += audioBuf.duration;
-}
-
-function connectTts() {
-  var api = apiInput.value.replace(/\/+$/, '');
-  var voice = voiceInput.value.trim() || 'de_DE-thorsten-medium';
-  var wsUrl = api.replace(/^http/, 'ws') + '/ws/tts?voice=' + encodeURIComponent(voice);
-
-  ttsWs = new WebSocket(wsUrl);
-  ttsWs.binaryType = 'arraybuffer';
-
-  ttsWs.onmessage = function(evt) {
-    if (typeof evt.data === 'string') {
-      if (evt.data === '__END__') return;
-      // Config message with sample_rate
-      try {
-        var cfg = JSON.parse(evt.data);
-        if (cfg.sample_rate) ttsSampleRate = cfg.sample_rate;
-      } catch (_) {}
-      return;
-    }
-    // Binary PCM → play
-    playPcmChunk(evt.data);
-  };
-
-  ttsWs.onerror = function() {
-    statusEl.textContent = 'TTS WebSocket-Fehler';
-  };
-
-  return new Promise(function(resolve) {
-    ttsWs.onopen = function() { resolve(); };
-  });
-}
-
 async function start() {
   transcript.innerHTML = '';
-  statusEl.textContent = 'Mikrofon wird angefordert...';
-  nextPlayTime = 0;
-
-  try {
-    mediaStream = await navigator.mediaDevices.getUserMedia({
-      audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true }
-    });
-  } catch (e) {
-    statusEl.textContent = 'Mikrofon-Zugriff verweigert: ' + e.message;
-    return;
-  }
-
-  audioCtx = new AudioContext();
-  var nativeRate = audioCtx.sampleRate;
-  var source = audioCtx.createMediaStreamSource(mediaStream);
-
-  analyser = audioCtx.createAnalyser();
-  analyser.fftSize = 512;
-  source.connect(analyser);
-
-  // Connect TTS WebSocket first
-  statusEl.textContent = 'Verbinde TTS...';
-  await connectTts();
-
-  // Connect STT WebSocket
+  statusEl.textContent = 'Verbinde...';
+  sessionId = uuid();
+  var profile = profileSel.value;
+  var voice = voiceInput.value.trim() || 'de_DE-thorsten-medium';
   var api = apiInput.value.replace(/\/+$/, '');
-  var sttUrl = api.replace(/^http/, 'ws') + '/ws/stt';
+  var wsBase = api.replace(/^http/, 'ws');
 
-  statusEl.textContent = 'Verbinde STT...';
-  sttWs = new WebSocket(sttUrl);
-  sttWs.binaryType = 'arraybuffer';
-
-  sttWs.onopen = function() {
-    // Send config with sample rate
-    sttWs.send(JSON.stringify({ sampleRate: nativeRate, chunkSeconds: 2.0, language: 'de' }));
-
-    // Start capturing PCM
-    var bufSize = 4096;
-    scriptNode = audioCtx.createScriptProcessor(bufSize, 1, 1);
-    scriptNode.onaudioprocess = function(e) {
-      if (!recording || !sttWs || sttWs.readyState !== WebSocket.OPEN) return;
-      var float32 = e.inputBuffer.getChannelData(0);
-      var int16 = new Int16Array(float32.length);
-      for (var i = 0; i < float32.length; i++) {
-        int16[i] = Math.max(-32768, Math.min(32767, Math.round(float32[i] * 32767)));
-      }
-      sttWs.send(int16.buffer);
-    };
-    source.connect(scriptNode);
-    scriptNode.connect(audioCtx.destination);
-
-    recording = true;
-    btn.textContent = 'Aufnahme stoppen';
-    btn.classList.add('recording');
-    statusEl.textContent = 'Streaming... (' + nativeRate + ' Hz → STT → TTS)';
-    updateLevel();
+  // Duplex pipeline:
+  //   RX: codec → resample → STT → NDJSON text out on this WS
+  //   TX: text in on this WS → TTS → resample → codec
+  var pipeConfig = {
+    pipes: [
+      'codec:' + sessionId + ' | resample:48000:16000 | stt:de | ws:ndjson',
+      'ws:text | tts:' + voice + ' | resample:22050:48000 | codec:' + sessionId
+    ]
   };
 
-  sttWs.onmessage = function(evt) {
+  pipeWs = new WebSocket(wsBase + '/ws/pipe');
+  pipeWs.binaryType = 'arraybuffer';
+
+  pipeWs.onopen = function () {
+    pipeWs.send(JSON.stringify(pipeConfig));
+    statusEl.textContent = 'Pipeline gestartet, verbinde Codec...';
+    connectCodec();
+  };
+
+  pipeWs.onmessage = function (evt) {
     if (typeof evt.data === 'string') {
       if (evt.data === '__END__') {
-        // STT done → close TTS
-        if (ttsWs && ttsWs.readyState === WebSocket.OPEN) {
-          ttsWs.send('__END__');
-        }
         statusEl.textContent = 'Fertig.';
         return;
       }
       try {
         var seg = JSON.parse(evt.data);
         addSegment(seg, '▶');
-        // Forward recognized text to TTS
-        if (ttsWs && ttsWs.readyState === WebSocket.OPEN && seg.text) {
-          ttsWs.send(seg.text);
+        // Forward recognized text back to pipe WS for TTS
+        if (pipeWs && pipeWs.readyState === WebSocket.OPEN && seg.text) {
+          pipeWs.send(seg.text);
         }
       } catch (_) {}
     }
   };
 
-  sttWs.onerror = function() {
-    statusEl.textContent = 'STT WebSocket-Fehler';
+  pipeWs.onerror = function () { statusEl.textContent = 'Pipeline WebSocket-Fehler'; };
+  pipeWs.onclose = function () {
+    if (recording) stop();
+    statusEl.textContent = 'Verbindung geschlossen.';
+  };
+}
+
+function connectCodec() {
+  var api = apiInput.value.replace(/\/+$/, '');
+  var wsBase = api.replace(/^http/, 'ws');
+  var profile = profileSel.value;
+
+  codecWs = new WebSocket(wsBase + '/ws/socket/' + sessionId);
+  codecWs.binaryType = 'arraybuffer';
+
+  codecWs.onopen = function () {
+    codecWs.send(JSON.stringify({ type: 'hello', profiles: [profile] }));
   };
 
-  sttWs.onclose = function() {
+  codecWs.onmessage = function (evt) {
+    if (typeof evt.data !== 'string') return;
+    try {
+      var obj = JSON.parse(evt.data);
+      if (obj.type === 'hello') {
+        statusEl.textContent = 'Streaming... (Profil: ' + obj.profile + ', STT → TTS)';
+        openChannels();
+      }
+      if (obj.error) statusEl.textContent = 'Fehler: ' + obj.error;
+    } catch (_) {}
+  };
+
+  codecWs.onerror = function () { statusEl.textContent = 'Codec WebSocket-Fehler'; };
+  codecWs.onclose = function () {
     if (recording) stop();
   };
 }
 
-async function stop() {
+function openChannels() {
+  // Speaker: receive TTS audio from codec socket
+  speaker = Codec.openSpeaker(codecWs);
+
+  // Mic: send audio to codec socket
+  Codec.openMic(codecWs, profileSel.value).then(function (h) {
+    mic = h;
+    recording = true;
+    btn.textContent = 'Aufnahme stoppen';
+    btn.classList.add('recording');
+    mic.onrms = function (rms) {
+      levelFill.style.width = Math.min(100, rms * 400) + '%';
+    };
+  }).catch(function (e) {
+    statusEl.textContent = 'Mikrofon-Zugriff verweigert: ' + e.message;
+  });
+}
+
+function stop() {
   recording = false;
   btn.textContent = 'Aufnahme starten';
   btn.classList.remove('recording');
   levelFill.style.width = '0%';
-  if (levelRaf) cancelAnimationFrame(levelRaf);
-  if (scriptNode) { scriptNode.disconnect(); scriptNode = null; }
-  if (analyser) { analyser.disconnect(); analyser = null; }
-  if (mediaStream) { mediaStream.getTracks().forEach(function(t) { t.stop(); }); mediaStream = null; }
-  if (audioCtx) { audioCtx.close(); audioCtx = null; }
 
-  // Signal end to STT
-  if (sttWs && sttWs.readyState === WebSocket.OPEN) {
-    sttWs.send('__END__');
-    statusEl.textContent = 'Warte auf letzte Ergebnisse...';
+  if (mic) { mic.close(); mic = null; }
+  if (speaker) { speaker.close(); speaker = null; }
+  if (codecWs && codecWs.readyState === WebSocket.OPEN) {
+    codecWs.send('__END__');
+    codecWs.close();
   }
+  codecWs = null;
+  if (pipeWs && pipeWs.readyState === WebSocket.OPEN) {
+    pipeWs.send('__END__');
+  }
+  statusEl.textContent = 'Warte auf letzte Ergebnisse...';
 }
 
-btn.addEventListener('click', function() {
+btn.addEventListener('click', function () {
   if (recording) stop(); else start();
 });
 </script>

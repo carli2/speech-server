@@ -24,6 +24,12 @@ from .QueueSource import QueueSource
 from .FileRecorder import FileRecorder
 from .AudioTee import AudioTee
 from .AudioMixer import AudioMixer
+from .GainStage import GainStage
+from .DelayLine import DelayLine
+from .CodecSocketSession import CodecSocketSession, get_session as get_codec_session
+from .CodecSocketSource import CodecSocketSource
+from .CodecSocketSink import CodecSocketSink
+from . import fourier_codec
 
 # Optional: SIP stages (require pyVoIP)
 try:

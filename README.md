@@ -14,6 +14,8 @@ Multi-voice TTS/STT HTTP server with realtime streaming, voice conversion, and p
 - **Streaming STT** (`POST /inputstream`) — PCM audio in via request body, NDJSON transcription out, single HTTP connection
 - **WebSocket STT** (`/ws/stt`) — PCM audio in via WebSocket binary frames, NDJSON text out. Works through Apache `mod_proxy_wstunnel` and in all browsers (Chrome, Firefox, Safari)
 - **WebSocket TTS** (`/ws/tts`) — text in via WebSocket text frames, PCM audio out as binary frames. Works through Apache `mod_proxy_wstunnel` and in all browsers
+- **Fourier codec** — custom FFT-based audio codec with multi-profile support (low/medium/high/full) for compressed real-time audio over WebSockets
+- **Codec WebSocket** (`/ws/socket/<id>`) — bidirectional codec-compressed audio with profile handshake
 - **SIP bridge** — dial into Asterisk conferences as a bot with full-duplex STT/TTS
 
 ## Architecture
@@ -54,7 +56,8 @@ WS   /ws/pipe       Generic:        DSL-defined pipeline (e.g. ws:pcm | resample
 | `SIPSource` | `lib/SIPSource.py` | done | Receives RTP audio from a SIP call as PCM stream via pyVoIP. |
 | `CLIReader` | `lib/CLIReader.py` | done | Reads text lines from stdin. For CLI tools (e.g. `sip_bridge.py`). |
 | `QueueSource` | `lib/QueueSource.py` | done | Reads PCM from a `queue.Queue`. Bridge between AudioTee/AudioMixer and their consumers. `None` = EOF sentinel. |
-| `AudioMixer` | `lib/AudioMixer.py` | done | Mixes N input queues into one output using `audioop.add()` on fixed-size frames. Used as source for mixed recordings. |
+| `AudioMixer` | `lib/AudioMixer.py` | done | Mixes N input queues into one output using `audioop.add()` on fixed-size frames. Hot-pluggable: add/remove inputs while streaming. |
+| `CodecSocketSource` | `lib/CodecSocketSource.py` | done | Reads decoded PCM s16le 48 kHz from a CodecSocketSession (Fourier codec over WebSocket). |
 
 #### Processors (transform PCM, have upstream)
 
@@ -64,7 +67,9 @@ WS   /ws/pipe       Generic:        DSL-defined pipeline (e.g. ws:pcm | resample
 | `PitchAdjuster` | `lib/PitchAdjuster.py` | done | Pitch shifting via ffmpeg rubberband (formant-preserving). Auto-estimation from source/target F0 or explicit semitone override. |
 | `SampleRateConverter` | `lib/SampleRateConverter.py` | done | Resampling between arbitrary sample rates via audioop (zero-latency, no subprocess). No-op when rates match. |
 | `EncodingConverter` | `lib/EncodingConverter.py` | done | Converts between audio encodings (s16le ↔ u8). Auto-inserted by `pipe()`. |
-| `AudioTee` | `lib/AudioTee.py` | done | Pass-through that copies data to side-chain sinks via queues in background threads. Used for recording while streaming. |
+| `AudioTee` | `lib/AudioTee.py` | done | Pass-through that copies data to side-chain sinks via queues in background threads. Hot-pluggable: add/remove sidechains while streaming. |
+| `GainStage` | `lib/GainStage.py` | done | Runtime-adjustable volume via `audioop.mul()`. `set_gain(float)` changes gain without rebuilding the pipeline. |
+| `DelayLine` | `lib/DelayLine.py` | done | Runtime-adjustable audio delay via ring buffer. `set_delay_ms(float)` changes delay without rebuilding the pipeline. |
 | `NoiseGate` | -- | **planned** | Removes silence/noise from the stream, reduces Whisper compute. |
 
 #### Sinks (consume PCM, produce output)
@@ -78,6 +83,7 @@ WS   /ws/pipe       Generic:        DSL-defined pipeline (e.g. ws:pcm | resample
 | `SIPSink` | `lib/SIPSink.py` | done | Writes PCM audio as RTP packets into a SIP call via pyVoIP. Counterpart to SIPSource. |
 | `CLIWriter` | `lib/CLIWriter.py` | done | Writes NDJSON lines or text to stdout. For CLI tools (e.g. `sip_bridge.py`). |
 | `FileRecorder` | `lib/FileRecorder.py` | done | Records PCM to file (MP3/WAV/OGG/etc.) by streaming to ffmpeg stdin. No temp files. Terminal sink. |
+| `CodecSocketSink` | `lib/CodecSocketSink.py` | done | Encodes upstream PCM to Fourier codec frames and sends via CodecSocketSession tx_queue. Terminal sink. |
 
 #### Adapters (not stages, but used by the pipeline)
 
@@ -95,6 +101,65 @@ WS   /ws/pipe       Generic:        DSL-defined pipeline (e.g. ws:pcm | resample
 | `FreeVCService` | `lib/vc_service.py` | done | Singleton FreeVC model manager. CPU/CUDA auto-detect. Used internally by VCConverter. |
 | `TTSRegistry` | `lib/registry.py` | done | Voice discovery, caching and lazy loading for Piper ONNX models. |
 | `SIPSession` | `lib/SIPSession.py` | done | pyVoIP lifecycle manager: registers SIP account, dials call, provides RX/TX audio queues. Optional (requires pyVoIP). |
+| `CodecSocketSession` | `lib/CodecSocketSession.py` | done | WebSocket session for the Fourier codec. Handles profile handshake, encode/decode, rx/tx queues. Global registry by session ID. |
+| `fourier_codec` | `lib/fourier_codec.py` | done | Python port of the FFT-based audio codec with multi-profile support (low/medium/high/full). numpy FFT, bit packing, PCM conversion. |
+
+### Fourier Codec
+
+The server includes a custom FFT-based audio codec for compressed real-time audio over WebSockets. Four quality profiles are available:
+
+| Profile | Bins | Freq range | Bits/component | ~Bytes/frame | Use case |
+|---------|------|------------|----------------|--------------|----------|
+| `low` | 160 | 0-7.5 kHz | 4-12 | ~157 | Telephone, low bandwidth |
+| `medium` | 256 | 0-12 kHz | 6-14 | ~410 | Good speech quality |
+| `high` | 384 | 0-18 kHz | 8-16 | ~920 | Near-CD quality |
+| `full` | 512 | 0-24 kHz | 16 (uniform) | ~2060 | Uncompressed (lossless within FFT) |
+
+All profiles share: `FRAME_SAMPLES=1024`, `SAMPLE_RATE=48000`, `FFT_SIZE=1024`, `HEADER_SIZE=12`, `VERSION=2`.
+
+#### Handshake Protocol
+
+When a client connects to `/ws/socket/<id>`:
+
+1. Client sends JSON: `{"type": "hello", "profiles": ["high", "medium", "low"]}`
+2. Server responds: `{"type": "hello", "profile": "medium", "session_id": "<id>"}`
+3. Both sides use the agreed profile for all subsequent binary frames
+
+If no hello is sent, the server defaults to its first configured profile.
+
+#### Codec Pipeline Examples
+
+```
+# Browser audio → STT (codec-compressed input)
+codec:abc123 | resample:48000:16000 | stt:de | ws:ndjson
+
+# TTS → browser audio (codec-compressed output)
+ws:text | tts:de_DE-thorsten-medium | resample:22050:48000 | codec:abc123
+
+# Full-duplex speech-to-speech via codec
+{"pipes": [
+  "codec:session1 | resample:48000:16000 | stt:de | ws:ndjson",
+  "ws:text | tts:de_DE-thorsten-medium | resample:22050:48000 | codec:session1"
+]}
+```
+
+#### JavaScript Client Library
+
+`examples/codec.js` provides encoding/decoding plus plug-and-play mic capture and playback:
+
+```js
+// Encode/decode
+const encoded = AudioCodec.encodeFrame(float32Samples, 'high');
+const decoded = AudioCodec.decodeFrame(encodedBytes);  // auto-detects profile
+
+// Open microphone → encode → send via WebSocket
+const mic = AudioCodec.openMic(ws, 'high');  // returns handle
+mic.close();  // stop
+
+// Receive → decode → play via WebSocket
+const spk = AudioCodec.openSpeaker(ws);  // returns handle
+spk.close();  // stop
+```
 
 ### SIP Integration
 
@@ -353,6 +418,9 @@ Each element: `type:param1:param2`
 | `record` | FILE or FILE:RATE | PCM -> PCM (pass-through) | AudioTee + FileRecorder sidechain |
 | `tee` | NAME | PCM -> PCM (pass-through) | AudioTee feeding named mixer |
 | `mix` | NAME or NAME:RATE | -- -> PCM (source only) | AudioMixer |
+| `gain` | FACTOR | PCM -> PCM | GainStage (1.0 = unity) |
+| `delay` | MS | PCM -> PCM | DelayLine |
+| `codec` | ID or ID:PROFILE | PCM via WS codec | CodecSocketSource / CodecSocketSink |
 
 Type transitions (automatically inserted):
 - `stt -> tts`: NdjsonToText adapter extracts `.text` from NDJSON
@@ -494,6 +562,7 @@ controller.close();
 |------|------|-------------|
 | STT | `examples/stt.html` | Microphone → WebSocket STT → transcript display |
 | STS | `examples/sts.html` | Microphone → STT → TTS → speaker (robot voice) |
+| Codec | `examples/codec-demo.html` | Mic → Fourier codec → WS → server → WS → decode → playback, with profile selector and record/playback |
 
 Open via `https://server/tts/examples/stt.html?api=https://server/tts`
 

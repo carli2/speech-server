@@ -512,6 +512,14 @@ def create_app(args: argparse.Namespace) -> Flask:
         # Note: Content headers for audio are applied by ResponseWriter
         return resp
 
+    # ---- Static files from examples/ directory ----
+    from flask import send_from_directory as _send_from_directory
+    _examples_dir = Path(__file__).resolve().parent / "examples"
+
+    @app.route("/examples/<path:filename>")
+    def serve_examples(filename):
+        return _send_from_directory(str(_examples_dir), filename)
+
     @app.route("/healthz", methods=["GET"])  # liveness
     def healthz() -> Tuple[str, int, Dict[str, str]]:
         return ("ok", 200, {"Content-Type": "text/plain"})
@@ -1017,6 +1025,32 @@ def create_app(args: argparse.Namespace) -> Flask:
                 ws.send(_json.dumps({"error": str(e)}))
             except Exception:
                 pass
+
+    # ---- Codec WebSocket endpoint ----
+    @sock.route("/ws/socket/<session_id>")
+    def ws_codec_socket(ws, session_id):
+        """Fourier-codec bidirectional audio socket.
+
+        Pipeline stages create a CodecSocketSession for *session_id*.
+        The browser connects here; the session handles handshake +
+        encode/decode and bridges to the pipeline via rx/tx queues.
+        """
+        from lib.CodecSocketSession import get_session
+        import json as _json
+        import time as _time
+
+        # Wait up to 5s for the session to be created by the pipeline
+        session = None
+        for _ in range(50):
+            session = get_session(session_id)
+            if session:
+                break
+            _time.sleep(0.1)
+
+        if not session:
+            ws.send(_json.dumps({"error": "Unknown session ID", "session_id": session_id}))
+            return
+        session.handle_ws(ws)
 
     # ---- WebSocket TTS streaming endpoint (alternative path) ----
     @sock.route("/tts/ws")

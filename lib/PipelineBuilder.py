@@ -62,6 +62,9 @@ class PipelineBuilder:
         record      FileRecorder sidechain (record:FILE or record:FILE:RATE)
         tee         AudioTee feeding a named mixer (tee:NAME)
         mix         AudioMixer source (mix:NAME or mix:NAME:RATE)
+        gain        GainStage            (gain:FACTOR)
+        delay       DelayLine            (delay:MS)
+        codec       CodecSocketSource/Sink (codec:ID or codec:ID:PROFILE)
     """
 
     def __init__(self, ws, registry, args) -> None:
@@ -70,6 +73,7 @@ class PipelineBuilder:
         self.args = args
         self._sip_sessions: Dict[str, Any] = {}
         self._mixers: Dict[str, Any] = {}  # name -> AudioMixer
+        self._codec_sessions: Dict[str, Any] = {}  # id -> CodecSocketSession
 
     def parse(self, pipe_str: str) -> List[Tuple[str, List[str]]]:
         """Parse ``'a:x:y | b:z | c'`` into ``[('a', ['x','y']), ('b', ['z']), ('c', [])]``."""
@@ -459,6 +463,69 @@ class PipelineBuilder:
                 run.stages.append(mixer)
                 current_output_type = "pcm"
 
+            elif typ == "gain":
+                from .GainStage import GainStage
+                factor = float(params[0]) if params else 1.0
+
+                if not current_stage or current_output_type != "pcm":
+                    raise ValueError("gain requires PCM upstream")
+
+                rate = 16000
+                encoding = "s16le"
+                if current_stage.output_format:
+                    rate = current_stage.output_format.sample_rate
+                    encoding = current_stage.output_format.encoding
+
+                stage = GainStage(rate, factor, encoding)
+                current_stage.pipe(stage)
+                current_stage = stage
+                run.stages.append(stage)
+                current_output_type = "pcm"
+
+            elif typ == "delay":
+                from .DelayLine import DelayLine
+                ms = float(params[0]) if params else 0.0
+
+                if not current_stage or current_output_type != "pcm":
+                    raise ValueError("delay requires PCM upstream")
+
+                rate = 16000
+                encoding = "s16le"
+                if current_stage.output_format:
+                    rate = current_stage.output_format.sample_rate
+                    encoding = current_stage.output_format.encoding
+
+                stage = DelayLine(rate, ms, encoding)
+                current_stage.pipe(stage)
+                current_stage = stage
+                run.stages.append(stage)
+                current_output_type = "pcm"
+
+            elif typ == "codec":
+                # codec:ID or codec:ID:PROFILE
+                if not params:
+                    raise ValueError("codec requires a session ID (e.g. codec:abc123)")
+                session_id = params[0]
+                profile = params[1] if len(params) > 1 else None
+
+                session = self._get_or_create_codec_session(session_id, profile)
+
+                if is_first:
+                    from .CodecSocketSource import CodecSocketSource
+                    stage = CodecSocketSource(session)
+                    current_stage = stage
+                    run.stages.append(stage)
+                    current_output_type = "pcm"
+                elif is_last:
+                    from .CodecSocketSink import CodecSocketSink
+                    sink = CodecSocketSink(session)
+                    if current_stage:
+                        current_stage.pipe(sink)
+                    run.stages.append(sink)
+                    run._run_fn = sink.run
+                else:
+                    raise ValueError("codec element can only appear at start or end of pipeline")
+
             else:
                 raise ValueError(f"Unknown pipeline element: {typ}")
 
@@ -486,6 +553,18 @@ class PipelineBuilder:
         mixer = AudioMixer(name, sample_rate)
         self._mixers[name] = mixer
         return mixer
+
+    def _get_or_create_codec_session(self, session_id: str, profile: Optional[str] = None):
+        if session_id in self._codec_sessions:
+            return self._codec_sessions[session_id]
+        from .CodecSocketSession import CodecSocketSession, get_session
+        # Reuse existing global session if already created by the WS route
+        session = get_session(session_id)
+        if session is None:
+            profiles = [profile] if profile else None
+            session = CodecSocketSession(session_id, server_profiles=profiles)
+        self._codec_sessions[session_id] = session
+        return session
 
     def _get_or_create_sip_session(self, target: str):
         if target in self._sip_sessions:

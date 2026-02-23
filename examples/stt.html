@@ -9,10 +9,12 @@
   .card { background: #16213e; border-radius: 12px; padding: 2rem; max-width: 560px; width: 100%; box-shadow: 0 4px 24px rgba(0,0,0,.4); }
   h1 { font-size: 1.4rem; margin-bottom: 1.2rem; color: #a8d8ea; }
   label { display: block; font-size: .85rem; color: #8899aa; margin-bottom: .3rem; }
-  input[type=text] {
+  input[type=text], select {
     width: 100%; padding: .5rem .8rem; border: 1px solid #2a3a5c; border-radius: 6px;
     background: #0f3460; color: #e0e0e0; font-size: .9rem; margin-bottom: 1rem;
   }
+  .row { display: flex; gap: .8rem; margin-bottom: 1rem; }
+  .row > * { flex: 1; }
   button {
     width: 100%; padding: .8rem; border: none; border-radius: 6px;
     font-size: 1rem; font-weight: 600; cursor: pointer; transition: background .2s;
@@ -41,40 +43,64 @@
   <label for="api-url">Server-URL</label>
   <input type="text" id="api-url" value="https://srv.launix.de/tts">
 
+  <div class="row">
+    <div>
+      <label for="profile">Codec-Profil</label>
+      <select id="profile">
+        <option value="low">low</option>
+        <option value="medium" selected>medium</option>
+        <option value="high">high</option>
+        <option value="full">full</option>
+      </select>
+    </div>
+    <div>
+      <label for="language">Sprache</label>
+      <input type="text" id="language" value="de">
+    </div>
+  </div>
+
   <button id="btn-rec">Aufnahme starten</button>
   <div id="level-bar"><div id="level-fill"></div></div>
   <div id="transcript"></div>
   <div id="status"></div>
 </div>
 
+<script src="codec.js"></script>
 <script>
-const apiInput   = document.getElementById('api-url');
-const btn        = document.getElementById('btn-rec');
-const transcript = document.getElementById('transcript');
-const statusEl   = document.getElementById('status');
-const levelFill  = document.getElementById('level-fill');
+var Codec = AudioCodec;
+var apiInput   = document.getElementById('api-url');
+var profileSel = document.getElementById('profile');
+var langInput  = document.getElementById('language');
+var btn        = document.getElementById('btn-rec');
+var transcript = document.getElementById('transcript');
+var statusEl   = document.getElementById('status');
+var levelFill  = document.getElementById('level-fill');
 
-const params = new URLSearchParams(location.search);
+var params = new URLSearchParams(location.search);
 if (params.get('api')) apiInput.value = params.get('api');
+if (params.get('profile')) profileSel.value = params.get('profile');
+if (params.get('lang')) langInput.value = params.get('lang');
 
-let recording = false;
-let mediaStream = null;
-let audioCtx = null;
-let analyser = null;
-let scriptNode = null;
-let levelRaf = null;
-let ws = null;
+var recording = false;
+var pipeWs = null;
+var codecWs = null;
+var mic = null;
+var sessionId = null;
+
+function uuid() {
+  return 'xxxx-xxxx'.replace(/x/g, function () { return (Math.random() * 16 | 0).toString(16); });
+}
 
 function fmtTime(s) {
-  const m = Math.floor(s / 60);
-  const sec = (s % 60).toFixed(1);
+  var m = Math.floor(s / 60);
+  var sec = (s % 60).toFixed(1);
   return m > 0 ? m + ':' + sec.padStart(4, '0') : sec + 's';
 }
 
 function addSegment(seg) {
-  const div = document.createElement('div');
+  var div = document.createElement('div');
   div.className = 'seg';
-  const timeSpan = document.createElement('span');
+  var timeSpan = document.createElement('span');
   timeSpan.className = 'time';
   timeSpan.textContent = '[' + fmtTime(seg.start) + '-' + fmtTime(seg.end) + ']';
   div.appendChild(timeSpan);
@@ -83,118 +109,106 @@ function addSegment(seg) {
   transcript.scrollTop = transcript.scrollHeight;
 }
 
-function updateLevel() {
-  if (!analyser) return;
-  const buf = new Uint8Array(analyser.fftSize);
-  analyser.getByteTimeDomainData(buf);
-  let sum = 0;
-  for (let i = 0; i < buf.length; i++) {
-    const v = (buf[i] - 128) / 128;
-    sum += v * v;
-  }
-  const rms = Math.sqrt(sum / buf.length);
-  levelFill.style.width = Math.min(100, rms * 400) + '%';
-  if (recording) levelRaf = requestAnimationFrame(updateLevel);
-}
-
 async function start() {
   transcript.innerHTML = '';
-  statusEl.textContent = 'Mikrofon wird angefordert...';
+  statusEl.textContent = 'Verbinde...';
+  sessionId = uuid();
+  var profile = profileSel.value;
+  var lang = langInput.value.trim() || 'de';
+  var api = apiInput.value.replace(/\/+$/, '');
+  var wsBase = api.replace(/^http/, 'ws');
 
-  try {
-    mediaStream = await navigator.mediaDevices.getUserMedia({
-      audio: { channelCount: 1, echoCancellation: false, noiseSuppression: false }
-    });
-  } catch (e) {
-    statusEl.textContent = 'Mikrofon-Zugriff verweigert: ' + e.message;
-    return;
-  }
+  // 1. Open pipe WS: codec source → resample → STT → NDJSON back on this WS
+  var pipeConfig = 'codec:' + sessionId + ' | resample:48000:16000 | stt:' + lang + ' | ws:ndjson';
 
-  audioCtx = new AudioContext();
-  const nativeRate = audioCtx.sampleRate;
-  const source = audioCtx.createMediaStreamSource(mediaStream);
+  pipeWs = new WebSocket(wsBase + '/ws/pipe');
+  pipeWs.binaryType = 'arraybuffer';
 
-  analyser = audioCtx.createAnalyser();
-  analyser.fftSize = 512;
-  source.connect(analyser);
-
-  // Build WebSocket URL from the HTTP API URL
-  const api = apiInput.value.replace(/\/+$/, '');
-  const wsUrl = api.replace(/^http/, 'ws') + '/ws/stt';
-
-  statusEl.textContent = 'Verbinde mit ' + wsUrl + '...';
-
-  ws = new WebSocket(wsUrl);
-  ws.binaryType = 'arraybuffer';
-
-  ws.onopen = function() {
-    // Send initial config with sample rate
-    ws.send(JSON.stringify({ sampleRate: nativeRate, language: 'de' }));
-
-    // Start capturing PCM audio
-    const bufSize = 4096;
-    scriptNode = audioCtx.createScriptProcessor(bufSize, 1, 1);
-    scriptNode.onaudioprocess = function(e) {
-      if (!recording || !ws || ws.readyState !== WebSocket.OPEN) return;
-      const float32 = e.inputBuffer.getChannelData(0);
-      const int16 = new Int16Array(float32.length);
-      for (let i = 0; i < float32.length; i++) {
-        int16[i] = Math.max(-32768, Math.min(32767, Math.round(float32[i] * 32767)));
-      }
-      ws.send(int16.buffer);
-    };
-    source.connect(scriptNode);
-    scriptNode.connect(audioCtx.destination);
-
-    recording = true;
-    btn.textContent = 'Aufnahme stoppen';
-    btn.classList.add('recording');
-    statusEl.textContent = 'Streaming... (' + nativeRate + ' Hz)';
-    updateLevel();
+  pipeWs.onopen = function () {
+    pipeWs.send(JSON.stringify({ pipe: pipeConfig }));
+    statusEl.textContent = 'Pipeline gestartet, verbinde Codec...';
+    connectCodec();
   };
 
-  ws.onmessage = function(evt) {
+  pipeWs.onmessage = function (evt) {
     if (typeof evt.data === 'string') {
       if (evt.data === '__END__') {
         statusEl.textContent = 'Fertig.';
         return;
       }
-      try {
-        addSegment(JSON.parse(evt.data));
-      } catch (_) {}
+      try { addSegment(JSON.parse(evt.data)); } catch (_) {}
     }
   };
 
-  ws.onerror = function() {
-    statusEl.textContent = 'WebSocket-Fehler';
-  };
-
-  ws.onclose = function() {
+  pipeWs.onerror = function () { statusEl.textContent = 'Pipeline WebSocket-Fehler'; };
+  pipeWs.onclose = function () {
     if (recording) stop();
     statusEl.textContent = 'Verbindung geschlossen.';
   };
 }
 
-async function stop() {
+function connectCodec() {
+  var api = apiInput.value.replace(/\/+$/, '');
+  var wsBase = api.replace(/^http/, 'ws');
+  var profile = profileSel.value;
+
+  codecWs = new WebSocket(wsBase + '/ws/socket/' + sessionId);
+  codecWs.binaryType = 'arraybuffer';
+
+  codecWs.onopen = function () {
+    // Handshake
+    codecWs.send(JSON.stringify({ type: 'hello', profiles: [profile] }));
+  };
+
+  codecWs.onmessage = function (evt) {
+    if (typeof evt.data !== 'string') return;
+    try {
+      var obj = JSON.parse(evt.data);
+      if (obj.type === 'hello') {
+        statusEl.textContent = 'Streaming... (Profil: ' + obj.profile + ')';
+        openMic();
+      }
+      if (obj.error) statusEl.textContent = 'Fehler: ' + obj.error;
+    } catch (_) {}
+  };
+
+  codecWs.onerror = function () { statusEl.textContent = 'Codec WebSocket-Fehler'; };
+  codecWs.onclose = function () {
+    if (recording) stop();
+  };
+}
+
+function openMic() {
+  Codec.openMic(codecWs, profileSel.value).then(function (h) {
+    mic = h;
+    recording = true;
+    btn.textContent = 'Aufnahme stoppen';
+    btn.classList.add('recording');
+    mic.onrms = function (rms) {
+      levelFill.style.width = Math.min(100, rms * 400) + '%';
+    };
+  }).catch(function (e) {
+    statusEl.textContent = 'Mikrofon-Zugriff verweigert: ' + e.message;
+  });
+}
+
+function stop() {
   recording = false;
   btn.textContent = 'Aufnahme starten';
   btn.classList.remove('recording');
   levelFill.style.width = '0%';
-  if (levelRaf) cancelAnimationFrame(levelRaf);
-  if (scriptNode) { scriptNode.disconnect(); scriptNode = null; }
-  if (analyser) { analyser.disconnect(); analyser = null; }
-  if (mediaStream) { mediaStream.getTracks().forEach(t => t.stop()); mediaStream = null; }
-  if (audioCtx) { audioCtx.close(); audioCtx = null; }
 
-  // Send END sentinel and close WebSocket
-  if (ws && ws.readyState === WebSocket.OPEN) {
-    ws.send('__END__');
-    statusEl.textContent = 'Warte auf letzte Ergebnisse...';
-    // Don't close immediately — wait for server's __END__ response
+  if (mic) { mic.close(); mic = null; }
+  if (codecWs && codecWs.readyState === WebSocket.OPEN) {
+    codecWs.send('__END__');
+    codecWs.close();
   }
+  codecWs = null;
+  // Don't close pipeWs yet — wait for final results
+  statusEl.textContent = 'Warte auf letzte Ergebnisse...';
 }
 
-btn.addEventListener('click', () => {
+btn.addEventListener('click', function () {
   if (recording) stop(); else start();
 });
 </script>

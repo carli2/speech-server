@@ -1,0 +1,294 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Fourier Codec Demo</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: system-ui, sans-serif; background: #1a1a2e; color: #e0e0e0; display: flex; justify-content: center; padding: 2rem; }
+  .card { background: #16213e; border-radius: 12px; padding: 2rem; max-width: 620px; width: 100%; box-shadow: 0 4px 24px rgba(0,0,0,.4); }
+  h1 { font-size: 1.4rem; margin-bottom: 1.2rem; color: #a8d8ea; }
+  label { display: block; font-size: .85rem; color: #8899aa; margin-bottom: .3rem; }
+  input[type=text], select {
+    width: 100%; padding: .5rem .8rem; border: 1px solid #2a3a5c; border-radius: 6px;
+    background: #0f3460; color: #e0e0e0; font-size: .9rem; margin-bottom: 1rem;
+  }
+  .row { display: flex; gap: .8rem; margin-bottom: 1rem; }
+  .row > * { flex: 1; }
+  button {
+    padding: .7rem 1rem; border: none; border-radius: 6px;
+    font-size: .9rem; font-weight: 600; cursor: pointer; transition: background .2s;
+    width: 100%;
+  }
+  .btn-connect { background: #e94560; color: #fff; }
+  .btn-connect:hover { background: #c73e54; }
+  .btn-connect.connected { background: #28a745; }
+  .btn-connect.connected:hover { background: #218838; }
+  .btn-mute { background: #5a5a8a; color: #fff; }
+  .btn-mute.muted { background: #e94560; }
+  .btn-record { background: #2a6a9a; color: #fff; }
+  .btn-record.active { background: #e94560; }
+  .btn-play { background: #2a9a6a; color: #fff; }
+  #level-bar { margin-top: .6rem; height: 6px; border-radius: 3px; background: #0f3460; overflow: hidden; }
+  #level-fill { height: 100%; width: 0%; background: #e94560; transition: width 60ms; }
+  #speaking { margin-top: .4rem; font-size: .8rem; color: #556; min-height: 1.1em; }
+  #handshake { margin-top: .8rem; font-size: .85rem; color: #8899aa; min-height: 1.2em; }
+  #log {
+    margin-top: 1rem; min-height: 120px; max-height: 260px; overflow-y: auto;
+    background: #0f3460; border-radius: 6px; padding: .8rem; font-size: .8rem;
+    font-family: monospace; line-height: 1.4; white-space: pre-wrap; word-break: break-all;
+  }
+  #log:empty::before { content: 'Log output...'; color: #556; }
+  #status { margin-top: .6rem; font-size: .85rem; color: #8899aa; min-height: 1.2em; }
+  .controls { display: flex; gap: .6rem; margin-top: .8rem; }
+  .controls button { flex: 1; }
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>Fourier Codec WebSocket</h1>
+
+  <label for="api-url">Server URL</label>
+  <input type="text" id="api-url" value="https://srv.launix.de/tts">
+
+  <div class="row">
+    <div>
+      <label for="session-id">Session ID</label>
+      <input type="text" id="session-id" placeholder="auto">
+    </div>
+    <div>
+      <label for="profile">Profile</label>
+      <select id="profile">
+        <option value="low">low (160 bins, ~157 B)</option>
+        <option value="medium">medium (256 bins, ~410 B)</option>
+        <option value="high" selected>high (384 bins, ~920 B)</option>
+        <option value="full">full (512 bins, ~2060 B)</option>
+      </select>
+    </div>
+  </div>
+
+  <button id="btn-connect" class="btn-connect">Connect</button>
+
+  <div id="level-bar"><div id="level-fill"></div></div>
+  <div id="speaking"></div>
+
+  <div class="controls">
+    <button id="btn-mute" class="btn-mute" disabled>Mute</button>
+    <button id="btn-record" class="btn-record" disabled>Record</button>
+    <button id="btn-play" class="btn-play" disabled>Play Recording</button>
+  </div>
+
+  <div id="handshake"></div>
+  <div id="status"></div>
+  <div id="log"></div>
+</div>
+
+<script src="codec.js"></script>
+<script>
+var Codec = AudioCodec;
+
+var apiInput    = document.getElementById('api-url');
+var sessionInput = document.getElementById('session-id');
+var profileSel  = document.getElementById('profile');
+var btnConnect  = document.getElementById('btn-connect');
+var btnMute     = document.getElementById('btn-mute');
+var btnRecord   = document.getElementById('btn-record');
+var btnPlay     = document.getElementById('btn-play');
+var levelFill   = document.getElementById('level-fill');
+var speakingEl  = document.getElementById('speaking');
+var handshakeEl = document.getElementById('handshake');
+var statusEl    = document.getElementById('status');
+var logEl       = document.getElementById('log');
+
+var params = new URLSearchParams(location.search);
+if (params.get('api')) apiInput.value = params.get('api');
+if (params.get('session')) sessionInput.value = params.get('session');
+if (params.get('profile')) profileSel.value = params.get('profile');
+
+var ws = null;
+var mic = null;
+var speaker = null;
+var connected = false;
+var negotiatedProfile = 'low';
+
+// Recording
+var recording = false;
+var recordedFrames = [];
+var FRAME_DURATION = Codec.FRAME_SAMPLES / Codec.SAMPLE_RATE;
+
+function uuid() {
+  return 'xxxx-xxxx'.replace(/x/g, function () { return (Math.random() * 16 | 0).toString(16); });
+}
+
+function log(msg) {
+  logEl.textContent += new Date().toLocaleTimeString() + ' ' + msg + '\n';
+  logEl.scrollTop = logEl.scrollHeight;
+}
+
+// --- Recording helpers ---
+
+function captureToBuffer(frames) {
+  if (!frames.length) return null;
+  var total = frames.length * Codec.FRAME_SAMPLES;
+  var buf = new Float32Array(total);
+  for (var i = 0; i < frames.length; i++) buf.set(frames[i], i * Codec.FRAME_SAMPLES);
+  return buf;
+}
+
+function playBuffer(buffer) {
+  var ctx = new AudioContext({ sampleRate: Codec.SAMPLE_RATE });
+  var abuf = ctx.createBuffer(1, buffer.length, Codec.SAMPLE_RATE);
+  abuf.getChannelData(0).set(buffer);
+  var src = ctx.createBufferSource();
+  src.buffer = abuf;
+  src.connect(ctx.destination);
+  src.start();
+  src.onended = function () { ctx.close(); };
+  log('Playing recording (' + (buffer.length / Codec.SAMPLE_RATE).toFixed(1) + 's)');
+}
+
+// --- Connect / Disconnect ---
+
+async function connect() {
+  var sessionId = sessionInput.value.trim() || uuid();
+  sessionInput.value = sessionId;
+  var profile = profileSel.value;
+
+  var api = apiInput.value.replace(/\/+$/, '');
+  var wsUrl = api.replace(/^http/, 'ws') + '/ws/socket/' + sessionId;
+
+  statusEl.textContent = 'Connecting to ' + wsUrl + '...';
+  log('Connecting: ' + wsUrl);
+
+  ws = new WebSocket(wsUrl);
+  ws.binaryType = 'arraybuffer';
+
+  ws.onopen = function () {
+    ws.send(JSON.stringify({ type: 'hello', profiles: [profile] }));
+    statusEl.textContent = 'Handshake...';
+  };
+
+  ws.onmessage = function (evt) {
+    // Only handle text (handshake); binary handled by speaker
+    if (typeof evt.data !== 'string') return;
+    try {
+      var obj = JSON.parse(evt.data);
+      if (obj.type === 'hello') {
+        negotiatedProfile = obj.profile;
+        handshakeEl.textContent = 'Profile: ' + negotiatedProfile +
+          ' (' + Codec.frameSizeBytes(negotiatedProfile) + ' B/frame)';
+        statusEl.textContent = 'Connected (' + negotiatedProfile + ')';
+        log('Handshake OK: profile=' + negotiatedProfile);
+        startChannels();
+        return;
+      }
+      if (obj.error) {
+        statusEl.textContent = 'Error: ' + obj.error;
+        log('Server error: ' + obj.error);
+      }
+    } catch (_) {}
+  };
+
+  ws.onerror = function () { statusEl.textContent = 'WebSocket error'; };
+  ws.onclose = function () {
+    if (connected) disconnect();
+    statusEl.textContent = 'Disconnected';
+  };
+}
+
+function startChannels() {
+  connected = true;
+  btnConnect.textContent = 'Disconnect';
+  btnConnect.classList.add('connected');
+  btnMute.disabled = false;
+  btnRecord.disabled = false;
+  btnPlay.disabled = false;
+
+  // Open speaker (receive + decode + play)
+  speaker = Codec.openSpeaker(ws);
+  speaker.onframe = function (samples) {
+    if (recording) recordedFrames.push(new Float32Array(samples));
+    if (speaker.rxFrames % 50 === 0 && speaker.rxFrames > 0) {
+      log('RX ' + speaker.rxFrames + ' frames (' + speaker.rxBytes + ' B)');
+    }
+  };
+
+  // Open mic (capture + encode + send)
+  Codec.openMic(ws, negotiatedProfile).then(function (h) {
+    mic = h;
+    mic.onrms = function (rms) {
+      levelFill.style.width = Math.min(100, rms * 400) + '%';
+      speakingEl.textContent = mic.speaking ? 'Speaking...' : '';
+    };
+    log('Mic opened (' + Codec.SAMPLE_RATE + ' Hz)');
+  }).catch(function (e) {
+    statusEl.textContent = 'Microphone denied: ' + e.message;
+    log('Mic error: ' + e.message);
+  });
+}
+
+function disconnect() {
+  connected = false;
+  recording = false;
+  btnConnect.textContent = 'Connect';
+  btnConnect.classList.remove('connected');
+  btnMute.disabled = true;
+  btnMute.classList.remove('muted');
+  btnMute.textContent = 'Mute';
+  btnRecord.disabled = true;
+  btnRecord.classList.remove('active');
+  btnRecord.textContent = 'Record';
+  btnPlay.disabled = true;
+  levelFill.style.width = '0%';
+  speakingEl.textContent = '';
+
+  var txInfo = mic ? 'TX=' + mic.txFrames : '';
+  var rxInfo = speaker ? ' RX=' + speaker.rxFrames : '';
+
+  if (mic) { mic.close(); mic = null; }
+  if (speaker) { speaker.close(); speaker = null; }
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send('__END__');
+    ws.close();
+  }
+  ws = null;
+  log('Disconnected. ' + txInfo + rxInfo);
+}
+
+// --- Button handlers ---
+
+btnConnect.addEventListener('click', function () {
+  if (connected) disconnect(); else connect();
+});
+
+btnMute.addEventListener('click', function () {
+  if (!mic) return;
+  mic.muted = !mic.muted;
+  btnMute.classList.toggle('muted', mic.muted);
+  btnMute.textContent = mic.muted ? 'Unmute' : 'Mute';
+});
+
+btnRecord.addEventListener('click', function () {
+  if (!recording) {
+    recordedFrames = [];
+    recording = true;
+    btnRecord.classList.add('active');
+    btnRecord.textContent = 'Stop Rec';
+    log('Recording started');
+  } else {
+    recording = false;
+    btnRecord.classList.remove('active');
+    btnRecord.textContent = 'Record';
+    log('Recorded ' + recordedFrames.length + ' frames (' +
+      (recordedFrames.length * FRAME_DURATION).toFixed(1) + 's)');
+  }
+});
+
+btnPlay.addEventListener('click', function () {
+  var buf = captureToBuffer(recordedFrames);
+  if (buf) playBuffer(buf);
+  else log('Nothing recorded yet');
+});
+</script>
+</body>
+</html>
