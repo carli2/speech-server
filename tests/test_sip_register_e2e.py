@@ -517,6 +517,11 @@ class TestSipRegisterWithFakeCrm:
         assert any("SIP/2.0 183 Session Progress" in data for data, _ in sent), (
             "registered-client INVITE was not accepted with 183 Session Progress"
         )
+        progress_sdp = next(
+            data for data, _ in sent if "SIP/2.0 183 Session Progress" in data
+        )
+        assert "a=fingerprint:" not in progress_sdp
+        assert "a=setup:" not in progress_sdp
         assert not any("SIP/2.0 404 Not Found" in data for data, _ in sent), (
             "server misclassified a registered client INVITE as an unregistered target"
         )

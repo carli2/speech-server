@@ -1826,7 +1826,13 @@ def _handle_trunk_invite(msg: dict, addr: Tuple[str, int], pbx_id: str) -> None:
 
     to_tag = _gen_tag()
     rtp_port = _find_free_port()
-    sdp = _build_sdp(_local_ip, rtp_port, codec=negotiated_codec)
+    remote_fp, _ = _parse_sdp_dtls(msg.get("body", ""))
+    sdp = _build_sdp(
+        _local_ip,
+        rtp_port,
+        codec=negotiated_codec,
+        include_dtls=bool(remote_fp),
+    )
 
     # Send 183 Session Progress with SDP — starts Early Media RTP
     resp = _build_response(183, "Session Progress", msg, to_tag=to_tag, body=sdp)
@@ -2148,7 +2154,13 @@ def _handle_registered_client_invite(
     negotiated_codec = codec_for_pt(remote_pt) or PCMU
     to_tag = _gen_tag()
     rtp_port = _find_free_port()
-    sdp = _build_sdp(_sdp_ip_for_remote_sdp(remote_host), rtp_port, codec=negotiated_codec)
+    remote_fp, _ = _parse_sdp_dtls(msg.get("body", ""))
+    sdp = _build_sdp(
+        _sdp_ip_for_remote_sdp(remote_host),
+        rtp_port,
+        codec=negotiated_codec,
+        include_dtls=bool(remote_fp),
+    )
 
     resp = _build_response(183, "Session Progress", msg, to_tag=to_tag, body=sdp)
     _send(resp, addr)
@@ -2166,7 +2178,6 @@ def _handle_registered_client_invite(
     }
 
     # Check if remote device offers DTLS-SRTP
-    remote_fp, _ = _parse_sdp_dtls(msg.get("body", ""))
     dtls_role = "server" if remote_fp else None
     rtp = RTPSession(rtp_port, remote_host, remote_port, codec=negotiated_codec,
                      dtls_role=dtls_role)
